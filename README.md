@@ -9,7 +9,7 @@ Build an AI shopping agent that asks useful follow-up questions and recommends t
 - A weak BM25 starter agent and deterministic local evaluator.
 - The Agent API contract and scoring rules.
 
-The organizer keeps 800 additional sessions private for final evaluation.
+The organizer keeps 800 additional sessions private for final evaluation.iii
 
 ## Task
 
