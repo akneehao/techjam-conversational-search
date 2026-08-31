@@ -327,25 +327,59 @@ CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
 # two signals add.  Measuring the layer against a broken control understated
 # what it contributes.
 #
-# DEFAULT MODEL: gbdt on the 3,000-query set (reranker/artifacts_3k).  On the
-# old RRF stage: gbdt 0.8418, simplex 0.8440, mlp 0.8380.  Simplex nominally
-# scores 0.0022 higher -- under one session on a 200-session set -- but gbdt is
-# the deliberate pick: simplex converges to a degenerate single-feature
-# solution (lexical_score = 1.0, all 13 other weights exactly 0.0, at BOTH
-# training sizes), while gbdt uses the full feature set and wins on the
-# 594-group offline test set, which has more statistical power.
+# DEFAULT MODEL: ranksvm on the 5,000-query set (reranker/artifacts_5k).
+#
+# Every model below was retrained on labels generated through the CURRENT first
+# stage (meta fusion_mode=rerank), then run through the official evaluator on
+# the fixed pipeline:
+#
+#   model          offline MRR (993 held-out groups)   evaluator (200 sessions)
+#   ranksvm            0.9476  (2nd, 1st on hits@1)        0.84849   <- default
+#   simplex            0.9398  (5th)                       0.84848
+#   mlp                0.9444  (4th)                       0.8431
+#   gbdt               0.9477  (1st)                       0.8250
+#   reinforce          0.6810  -- BELOW the 0.7298 first-stage baseline
+#   (simplex on the older 751-query set scored 0.8498)
+#
+# Two things that ranking settles:
+#
+# 1. THE OFFLINE TEST SET CANNOT BE TRUSTED ALONE.  It is a held-out split of
+#    the same self-supervised distribution used for training (queries built
+#    from product text with token dropout + filler words), while the evaluator
+#    uses templated shopper messages.  gbdt tops the offline table and comes
+#    LAST on the evaluator, 0.024 behind.  It is the only tree model, so it can
+#    fit sharp splits on the synthetic query style that do not survive the
+#    distribution shift.  Selecting on offline metrics alone would ship it.
+#
+# 2. THE TOP THREE ARE TIED.  ranksvm 0.84849, simplex/5k 0.84848 and
+#    simplex/751 0.8498 sit inside a quarter of one session on a 200-session
+#    set, so the score does not choose between them.  ranksvm wins on grounds
+#    that are not noise:
+#      * best coverage -- hit@10 0.965 vs 0.960, and hit@10 is 0.50 of the
+#        composite (every 5k model gained this; the aligned training set
+#        genuinely improved recall into the top ten)
+#      * strong on BOTH metrics -- top-2 offline and top-1 on the evaluator,
+#        so its result is not an artifact of either measurement
+#      * honest provenance -- trained on candidates from the real serving
+#        pipeline, using all 14 features.  simplex/751 transfers only because
+#        it is degenerate: a one-hot on lexical_score ignores the very rank
+#        features its RRF-aligned training had mismatched.
+#      * pure numpy -- a weight vector and a dot product, no lightgbm at
+#        inference.  That is a live reliability concern, not a style
+#        preference: loading the gbdt booster from a CRLF-converted checkout
+#        aborts the interpreter natively (see .gitattributes / load_gbdt).
 #
 # NOTE: one of the original arguments for gbdt was that simplex "has no
 # graceful behaviour if the hidden sessions paraphrase rather than quote
 # product wording".  The final-evaluation FAQ (S1) has since settled that --
 # the private sessions use the same deterministic templates and "no
 # undisclosed natural-language paraphrases are introduced" -- so that
-# particular risk is gone.  The offline-test-set argument still stands.
+# particular risk is gone.
 # See docs/first_stage_ablation.md and docs/reranker_eval_results.md.
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "gbdt")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "ranksvm")
 RERANK_ARTIFACTS_DIR = Path(
-    os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts_3k"))
+    os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts_5k"))
 )
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "60"))
 

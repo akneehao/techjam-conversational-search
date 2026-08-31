@@ -1,0 +1,16 @@
+{
+  "node_profile_sim": 1045.092710018158,
+  "max_desc_sim": 614.6889338493347,
+  "avg_top5_desc_sim": 955.581867814064,
+  "sibling_coherence": 1479.2013992071152,
+  "lexical_score": 425153.7581846714,
+  "path_score": 878.7857336997986,
+  "sibling_max_sim": 805.824117898941,
+  "parent_sim": 761.8576275110245,
+  "query_token_count": 7996.845154643059,
+  "query_max_node_sim": 2093.221491098404,
+  "query_embedding_norm": 28.30174958705902,
+  "bm25_rank_score": 16016.175140976906,
+  "dense_rank_score": 2144.9073116779327,
+  "rrf_score": 8863.343270659447
+}

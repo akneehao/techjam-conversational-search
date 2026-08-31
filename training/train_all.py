@@ -61,9 +61,22 @@ def main() -> None:
     parser.add_argument("--run-grid-search", type=int, default=0)
     parser.add_argument("--models", default="all",
                          help="Comma-separated subset to train (baseline,simplex,ranksvm,"
-                              "coord_ascent,reinforce,mlp,gbdt) or 'all'.")
+                              "coord_ascent,reinforce,mlp,gbdt), 'all' (excludes reinforce), "
+                              "or 'everything' to include reinforce.")
     args = parser.parse_args()
-    wanted = {m.strip() for m in args.models.split(",")} if args.models != "all" else None
+
+    # 'all' deliberately excludes reinforce: on the 5,000-query set it scores
+    # MRR 0.6810 against a 0.7298 first-stage baseline, i.e. it ranks WORSE than
+    # the ordering it is handed, so it can only ever destroy the first stage.
+    # It also costs 266s of the ~990s run. Feature standardisation and gradient
+    # clipping fixed its outright divergence but not this. Pass
+    # --models everything (or name it explicitly) to train it anyway.
+    if args.models == "all":
+        wanted = {"baseline", "simplex", "ranksvm", "coord_ascent", "mlp", "gbdt"}
+    elif args.models == "everything":
+        wanted = None
+    else:
+        wanted = {m.strip() for m in args.models.split(",")}
 
     def want(name: str) -> bool:
         return wanted is None or name in wanted
