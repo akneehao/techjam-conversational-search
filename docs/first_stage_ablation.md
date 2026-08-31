@@ -198,13 +198,52 @@ truststore.inject_into_ssl()` before constructing the `Agent`. Certificate
 verification stays enabled — do not disable it. After the cache exists,
 `HF_HUB_OFFLINE=1` avoids the network entirely.
 
-## Open items
+## The Gemini router, measured
 
-- **The Gemini path is still unmeasured end-to-end.** Every number here and in
-  `reranker_eval_results.md` was produced with `AGENT_USE_LLM=0`, so reported
-  token usage is 0 throughout and the router, the profile `pf` field and the
-  compact schema have never run against the live API. One evaluator run with a
-  key is the highest-value remaining check.
+One run with a live key, same shipped configuration:
+
+| | HitRate@10 | MRR | MTTC | TechnicalScore | tokens |
+|---|---|---|---|---|---|
+| `AGENT_USE_LLM=0` | 0.960 | 0.682 | 2.75 | 0.8498 | 0 |
+| `AGENT_USE_LLM=1` | 0.955 | 0.682 | 2.77 | 0.8468 | 5,536 |
+
+**Do not read that second row as "the router costs 0.003".** The run is not a
+valid measurement of the LLM path, for a reason worth recording.
+
+The free-tier key returns HTTP 429 after ~16 calls. `reported_token_usage` of
+5,536 confirms it: at ~342 tokens/call that is 16 calls across 200 sessions,
+not the ~1,200 a full run needs. Three consecutive 429s then tripped the
+circuit breaker, and because the evaluator constructs one `Agent` for all 200
+sessions, the breaker stayed tripped for the remaining ~184. So the row above
+is roughly 8 LLM-routed sessions followed by 192 deterministic ones -- within
+noise of the `AGENT_USE_LLM=0` row, which is exactly what it mostly is.
+
+**The router's real contribution remains unmeasured**, and needs a key with
+enough quota for ~1,200 calls (or a slow run pacing under the rate limit).
+Verified working in isolation: a single live call returns the compact schema
+correctly and the profile round-trips
+(`{"i":"buying","sl":{"category":"jackets","gender":"men","material":"wool"},
+"kw":["100%","wool"],"ov":false,"pf":["warmth"]}` for a `warmth` profile).
+
+### What that exposed
+
+The Day 2 breaker tripped **permanently** after any 3 consecutive failures,
+regardless of cause. In a 200-session batch run against one `Agent`, that turns
+a transient rate limit into a silently disabled feature for the rest of the
+run -- and the run still looks like it had an LLM.
+
+Failures are now classified:
+
+| cause | behaviour |
+|---|---|
+| 400 / 401 / 403 (bad key, bad request, API disabled) | trip permanently -- retrying cannot help |
+| 429 / 5xx / timeout / transport | exponential backoff 2s -> 60s, recovers on its own |
+| success | streak and cooldown reset |
+
+Cost per call, measured live: 283 prompt + 59 completion = **342 tokens**
+(estimate was 313).
+
+## Open items
 - The re-ranker requires the dense track (`_init_reranker` gates on
   `_dense_on()`), because its feature extractor needs the document vectors —
   even for simplex, whose one live feature is lexical. Dense therefore cannot

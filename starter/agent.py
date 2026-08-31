@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -636,8 +637,9 @@ class Agent:
         self._order_by = "bm25(products, " + ", ".join(str(w) for w in BM25_WEIGHTS) + ")"
         self._llm_model = model
         self._llm_key = self._init_llm(use_llm)
-        self._llm_broken = False           # circuit breaker (permanent once tripped)
-        self._llm_fail_streak = 0          # consecutive failures; 3 -> trip the breaker
+        self._llm_broken = False           # permanent trip (auth / bad request only)
+        self._llm_fail_streak = 0          # consecutive transient failures
+        self._llm_cooldown_until = 0.0     # transient backoff deadline (monotonic)
         self._route_cache: dict[tuple, dict] = {}
         self.llm_usage_total = {"prompt_tokens": 0, "completion_tokens": 0}  # for disclosure
         # dense track (Day 4) / semantic re-ranker (Day 5)
@@ -658,13 +660,43 @@ class Agent:
         self._init_reranker()
 
     def _llm_on(self) -> bool:
-        """True when the Gemini router is configured and hasn't hard-failed."""
-        return bool(self._llm_key) and not self._llm_broken
+        """True when the router is configured, not hard-failed, and not cooling down."""
+        if not self._llm_key or self._llm_broken:
+            return False
+        return time.monotonic() >= self._llm_cooldown_until
 
-    def _note_llm_failure(self) -> None:
-        self._llm_fail_streak += 1
-        if self._llm_fail_streak >= 3:  # bad key / offline / quota -> stop trying this run
+    def _note_llm_failure(self, error: BaseException | None = None) -> None:
+        """Classify a router failure and choose the right degradation.
+
+        The Day 2 breaker tripped permanently after any 3 consecutive failures.
+        That is wrong for a batch run: the Agent is constructed once for all 200
+        sessions, so a single transient blip early on disabled the router for
+        every remaining session.  Measured on the public set -- a free-tier key
+        returns HTTP 429 after ~16 calls, which tripped the breaker and left
+        ~184 sessions on the deterministic parser while the run still *looked*
+        like it had an LLM.
+
+        So failures are now split by what they actually mean:
+
+          * 400 / 401 / 403 -- bad key, bad request, disabled API.  Retrying
+            cannot help; trip permanently and stop paying the latency.
+          * 429 / 5xx / timeout / transport -- rate limit or a blip.  Back off
+            exponentially (2s, 4s, 8s ... capped at 60s) and recover on its own.
+
+        Either way the current turn already fell back to the deterministic
+        parser, so this only decides how soon the router is tried again.
+        """
+        status = getattr(error, "code", None)
+        if status in (400, 401, 403):        # unrecoverable -- stop trying this run
             self._llm_broken = True
+            return
+        self._llm_fail_streak += 1
+        backoff = min(60.0, 2.0 ** min(self._llm_fail_streak, 5))
+        self._llm_cooldown_until = time.monotonic() + backoff
+
+    def _note_llm_success(self) -> None:
+        self._llm_fail_streak = 0
+        self._llm_cooldown_until = 0.0
 
     @staticmethod
     def _init_llm(use_llm: bool | None) -> str | None:
@@ -1081,15 +1113,16 @@ class Agent:
         try:
             state["llm_calls"] += 1
             parsed, prompt_tokens, completion_tokens = self._call_router(state, message)
-        except Exception:
+        except Exception as error:
             # Any failure at all -- timeout, HTTP error, bad JSON, schema drift --
             # is non-fatal: the deterministic Day 1 parser has already ingested
             # this turn, so retrieval proceeds on BM25 exactly as if the LLM were
-            # disabled.  Three consecutive failures trip the breaker for the run.
-            self._note_llm_failure()
+            # disabled.  ``_note_llm_failure`` decides whether to back off and
+            # retry later (429/5xx) or stop for the run (bad key).
+            self._note_llm_failure(error)
             return 0, 0
 
-        self._llm_fail_streak = 0
+        self._note_llm_success()
         self._route_cache[cache_key] = parsed
         if len(self._route_cache) > 4096:
             self._route_cache.clear()
@@ -1457,8 +1490,8 @@ class Agent:
             text, prompt_tokens, completion_tokens = self._gemini_generate(
                 _CLARIFY_SYSTEM, prompt, max_tokens=80
             )
-        except Exception:
-            self._note_llm_failure()
+        except Exception as error:
+            self._note_llm_failure(error)
             return fallback, 0, 0
         self.llm_usage_total["prompt_tokens"] += prompt_tokens
         self.llm_usage_total["completion_tokens"] += completion_tokens
