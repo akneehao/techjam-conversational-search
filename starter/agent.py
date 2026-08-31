@@ -198,6 +198,52 @@ RERANK_ARTIFACTS_DIR = Path(
 )
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "60"))
 
+# -- Day 5b: personalized context distillation ----------------------------- #
+# The aggregate ``user_profile`` is distilled once per session in ``reset()``.
+# PROFILE_INJECT decides whether those distilled tags may reach *retrieval*:
+#   0 (default) -- never. The profile only conditions how the router reads a
+#                  message; it cannot add or remove candidates.
+#   1           -- inject only tags outside GENERIC (performance/warmth/...).
+#   2           -- inject every tag, i.e. the literal "append the profile to
+#                  the search constraints" reading.
+# Measured on the 200 public sessions, GENERIC already covers 91% of all tag
+# occurrences (fit 82%, material 77%, comfort 72%, style 50%, durability 24%),
+# so level 2 mostly feeds high-frequency noise to the query builder. Levels 1
+# and 2 exist to make that claim measurable rather than assumed.
+PROFILE_INJECT = int(os.environ.get("PROFILE_INJECT", "0") or 0)
+
+
+def _distil_profile(user_profile: dict) -> dict:
+    """Reduce the aggregate profile to the few fields worth carrying per session.
+
+    ``salient_tags`` drops anything in GENERIC plus multi-word tags: those are
+    too common in clothing text to discriminate between candidates, which is
+    exactly why they must never be allowed to gate a match.
+    """
+    empty = {"tags": [], "salient_tags": [], "summary": "", "rating_style": ""}
+    if not isinstance(user_profile, dict):
+        return empty
+
+    tags: list[str] = []
+    for tag in user_profile.get("preference_tags") or ():
+        if not isinstance(tag, str):
+            continue
+        cleaned = tag.strip().lower()
+        if cleaned and cleaned not in tags:
+            tags.append(cleaned)
+
+    def _text(key: str) -> str:
+        value = user_profile.get(key)
+        return value.strip() if isinstance(value, str) else ""
+
+    return {
+        "tags": tags,
+        "salient_tags": [t for t in tags if t not in GENERIC and " " not in t],
+        "summary": _text("summary"),
+        "rating_style": _text("rating_style"),
+    }
+
+
 # messages that carry no new constraint -- never worth an LLM call
 _NO_INFO_MARKERS = (
     "additional preference", "please use your judgment", "please use your judgement",
@@ -206,15 +252,9 @@ _NO_INFO_MARKERS = (
 
 _ROUTER_SYSTEM = (
     "You are the intent router for a Clothing/Shoes/Jewelry shopping search agent.\n"
-    "Given the current conversation state and the newest customer message, reply with "
-    "ONE JSON object and nothing else:\n"
-    '{\n'
-    '  "intent": "buying" | "browsing",\n'
-    '  "extracted_slots": {"category": str|null, "gender": str|null, "color": str|null,\n'
-    '                      "material": str|null, "style": str|null, "brand": str|null,\n'
-    '                      "use_case": str|null, "budget": str|null, "keywords": [str]},\n'
-    '  "intent_override": true | false\n'
-    '}\n'
+    "Given the conversation state and the newest customer message, return the "
+    "routing object. The response schema is enforced by the API, so do not "
+    "restate or explain it.\n"
     "Rules:\n"
     "- intent=\"buying\" when the customer gives firm, specific requirements; "
     "\"browsing\" when vague, exploring, or only a broad category is known.\n"
@@ -225,6 +265,9 @@ _ROUTER_SYSTEM = (
     "- intent_override=true ONLY when the customer abandons the previously stated "
     "product CATEGORY for a different one (\"actually I want a dress instead\"). "
     "A changed colour/material/size/fit/preference is NOT an override.\n"
+    "- shopper_prior_aspects describes what the shopper's PAST purchases "
+    "emphasised. It is background, NOT a request: never copy it into a slot or "
+    "keyword. Use it only to disambiguate wording used in THIS message.\n"
     "Output JSON only, no prose."
 )
 
@@ -669,14 +712,24 @@ class Agent:
             "exhausted": False,
             "stale": 0,
             "last_signature": None,
+            # ---- distilled long-term profile (Day 5b) -----------------------
+            "profile": {"tags": [], "salient_tags": [], "summary": "", "rating_style": ""},
         }
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         # Fresh conversational memory for the session (intent, constraint slots,
-        # keyword bag, message history -- see ``_new_state``).  The aggregate
-        # profile is intentionally not folded into sparse retrieval: its
-        # preference tags ("fit", "comfort", ...) are high-frequency noise here.
-        self._state[session_id] = self._new_state()
+        # keyword bag, message history -- see ``_new_state``).
+        state = self._new_state()
+        # Personalized context distillation: reduce the aggregate profile once,
+        # here, then let it *interpret* later turns.  It stays out of sparse
+        # retrieval by default -- its preference tags ("fit", "comfort", ...)
+        # are high-frequency noise, 91% of them already in GENERIC -- unless
+        # PROFILE_INJECT says otherwise (see the constant for the levels).
+        state["profile"] = _distil_profile(user_profile)
+        if PROFILE_INJECT:
+            key = "tags" if PROFILE_INJECT >= 2 else "salient_tags"
+            state["keywords"] = list(state["profile"][key])
+        self._state[session_id] = state
 
     # -- per-turn ingestion of the simulated customer's message -------------- #
     def _ingest(self, state: dict, message: str, turn: int) -> None:
@@ -795,6 +848,13 @@ class Agent:
             "known_slots": {k: v for k, v in state["slots"].items() if v},
             "known_keywords": state["keywords"][-12:],
         }
+        # Read-only personalization. Only the tags travel: `summary` is itself
+        # generated from those same tags ("Prior purchases emphasize material,
+        # fit; ..."), so sending both would spend prompt tokens restating them.
+        # _ROUTER_SYSTEM forbids turning these into slots or keywords.
+        prior_aspects = (state.get("profile") or {}).get("tags") or []
+        if prior_aspects:
+            context["shopper_prior_aspects"] = prior_aspects
         user_block = (
             "CONVERSATION STATE:\n" + json.dumps(context, ensure_ascii=False)
             + "\n\nNEW CUSTOMER MESSAGE:\n" + message.strip()
