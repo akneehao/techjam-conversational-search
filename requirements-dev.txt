@@ -1,0 +1,13 @@
+# Dev/training-only. Needed to run training/*.py and notebooks/*.ipynb --
+# NOT required to run the submitted agent (see requirements.txt). scipy,
+# scikit-learn, and torch are training-time dependencies for the Simplex,
+# RankSVM, and MLP rankers respectively; none of the three is imported by
+# starter/agent.py or by starter/reranker/ at serving time.
+-r requirements.txt
+scipy>=1.11
+scikit-learn>=1.3
+torch>=2.0
+jupyter
+ipykernel
+pandas
+matplotlib

@@ -11,3 +11,10 @@ numpy>=1.26
 sentence-transformers>=3.0
 # CPU-only torch is enough:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
+# Day 5 -- learned re-ranking layer (optional). Without this (or with
+#   RERANK_ENABLED=0) the agent falls back to the Day 4 RRF-fused order.
+#   The linear/MLP rerankers need only numpy (already required above); the
+#   GBDT sub-model additionally needs lightgbm -- if unavailable, the
+#   ensemble degrades to MLP-only, then further to plain RRF.
+lightgbm>=4.0
