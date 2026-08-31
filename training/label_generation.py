@@ -5,7 +5,7 @@ product's full title+categories+features text, and the positives were that
 product's category *siblings*, with the grade-2 positive chosen as the
 sibling most cosine-similar to the query. Evaluated against the official
 evaluator, every model trained on it scored below the plain RRF ordering
-(see docs/reranker_eval_results.md). Three defects caused that:
+(see README.md section 6.1). Three defects caused that:
 
   1. Label leakage. Picking the grade-2 positive by "most cosine-similar
      sibling" made the `sibling_max_sim` feature nearly encode the labelling

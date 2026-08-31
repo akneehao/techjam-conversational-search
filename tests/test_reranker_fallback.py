@@ -98,8 +98,10 @@ class RerankerFallbackTest(unittest.TestCase):
 
     @unittest.skipUnless(_HAS_TRAINED_ARTIFACTS, "requires trained reranker artifacts + the full catalog")
     def test_reranker_on_by_default_when_artifacts_present(self) -> None:
-        # v2 GBDT beats the plain RRF order by +0.0653 TechnicalScore on the
-        # public set, so it ships enabled (see docs/reranker_eval_results.md).
+        # The learned re-ranker defaults to enabled, so that a run with the
+        # optional dense track on picks it up. It is not on the submitted path:
+        # that run sets DENSE_ENABLED=0 and _init_reranker returns early
+        # without the dense features. See README.md section 5.
         script = (
             "from starter.agent import Agent\n"
             f"agent = Agent(r'{_CATALOG_PATH}', use_llm=False, use_dense=True)\n"

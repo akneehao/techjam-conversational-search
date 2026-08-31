@@ -357,7 +357,14 @@ CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
 # additive.  They are kept independently switchable so the choice is empirical:
 #   FUSION_MODE=rrf    RERANK_ENABLED=1   -> the as-built Day 5 pipeline  0.8410
 #   FUSION_MODE=rerank RERANK_ENABLED=0   -> first-stage fix alone        0.8387
-#   FUSION_MODE=rerank RERANK_ENABLED=1   -> both composed (SHIPPED)      0.8498
+#   FUSION_MODE=rerank RERANK_ENABLED=1   -> both composed                0.8498
+#
+# NOTE (layers 8/9): none of those three is the submitted configuration any
+# more.  The submitted run sets DENSE_ENABLED=0, and ``_init_reranker`` returns
+# early without the dense track -- so this whole layer is LOADED BUT NEVER RUNS
+# on the scored path, which reaches 0.8870 without it.  Everything below is the
+# record of how the layer was built and chosen; it still applies whenever the
+# optional dense track is switched back on.
 #
 # Measured, the redundancy hypothesis is WRONG: the layers compose, and the
 # learned re-ranker is worth +0.0111 on a fixed first stage (MRR 0.643 ->
@@ -421,7 +428,8 @@ CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
 # the private sessions use the same deterministic templates and "no
 # undisclosed natural-language paraphrases are introduced" -- so that
 # particular risk is gone.
-# See docs/first_stage_ablation.md and docs/reranker_eval_results.md.
+# The full ablation and model-selection reasoning is in README.md, sections
+# 5 and 6.
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "ranksvm")
 RERANK_ARTIFACTS_DIR = Path(

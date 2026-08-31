@@ -2,7 +2,9 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .env
-results.json
+# results.json is deliberately NOT ignored: docs/submission_rules.md requires
+# the generated results, the commit hash and the environment details to be
+# retained with the frozen commit. Scratch sweep outputs below still are.
 data/catalog.jsonl
 data/catalog.jsonl.gz
 data/releases/

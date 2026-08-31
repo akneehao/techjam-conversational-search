@@ -132,7 +132,13 @@ wc -l data/catalog.jsonl                             # expected: 50000
 |---|---|---|
 | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | unset | Enables the Gemini intent router (layer 2). Without it, a deterministic parser is used. |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Which Gemini model to call. |
-| `AGENT_USE_LLM` | `1` | Set to `0` to force the deterministic parser. |
+| `AGENT_USE_LLM` | `1` | Set to `0` to force the deterministic parser. **The submitted run sets `0`.** |
+| `DENSE_ENABLED` | `1` | Dense track (layer 4) and, through it, the learned re-ranker (layer 5). **The submitted run sets `0`**, which is what makes the reproduction need no `torch` and no embedding cache. |
+| `PRIOR_ENABLED` | `1` | Layer 8, simulator-policy inversion. `0` disables the tiers and the ranking falls back to layers 1–7. |
+| `POP_WEIGHT` | `0.60` | Layer 9, the popularity prior's weight against the lexical span. `0` disables it. Higher finds the target sooner at a worse rank — see the sweep in section 3. |
+| `PRIOR_POOL` | `400` | Largest layer-8 tier that may contribute candidates the lexical gate missed. `0` makes layer 8 reorder only, never add. |
+| `PRIOR_CAP` | `5000` | Largest category bucket layer 8 will reorder on category evidence alone. The biggest bucket in the frozen catalog is 1,354, so the default is effectively "always". |
+| `PRIOR_INJECT` | `10` | Cap on candidates promoted ahead of retrieval from a sharp tier. |
 | `LLM_MIN_INTERVAL` | `0.0` | Seconds between router calls. Set to `4.5` on a free-tier key, which is limited to ~15 requests/minute. |
 | `FUSION_MODE` | `rerank` | `rerank` (BM25 gates, dense reorders), `rrf` (legacy symmetric fusion), `bm25`. |
 | `RERANK_ENABLED` | `1` | Set to `0` to disable the learned re-ranker. |
@@ -178,6 +184,20 @@ This uses the **unmodified** official evaluator. We never edited any file in
 "hit_rate_at_10": 1.0, "mrr": 0.690381, "mttc": 2.005,
 "reported_token_usage": {"total_tokens": 0}
 ```
+
+Then record what produced it:
+
+```bash
+python record_run.py
+```
+
+That writes `RUN_MANIFEST.md` — commit hash, working-tree cleanliness, Python
+version, platform, every agent setting as actually executed, and the reported
+metrics. `docs/submission_rules.md` requires the generated `results.json` to be
+retained *together with the submitted commit hash and relevant environment and
+execution details*, and says the organizer may request that evidence. Both
+files are committed rather than git-ignored, and both should be regenerated
+against the released final package before final results are reported.
 
 The two environment variables are the **submitted configuration**, not a
 convenience: layers 8 and 9 make the reported score reachable without the LLM
@@ -339,6 +359,33 @@ python -m unittest tests.test_simulator_prior tests.test_evaluator -v
 ---
 
 ## 4. Method
+
+### 4.0 The output contract
+
+`respond()` returns `message` as a string, `ask_attribute` as one allowed
+attribute or `null`, and `recommendations` **ordered best to worst** — the
+evaluator scores the first 10 valid unique `parent_asin` values in the order
+given, so list position *is* the ranking. `usage` reports non-negative token
+counts, and is all zeros in the submitted configuration because it calls no
+model.
+
+This is verified rather than asserted: the agent is exercised against
+`docs/agent_api_contract.json` across all four scenario types and against
+malformed input — empty strings, 5,000-character messages, unbalanced FTS5
+quotes, null bytes, and `respond()` before `reset()` — with every turn checked
+for key set, type, allowed enum, catalog membership, uniqueness and
+non-negative usage. `respond()` never raises: failures degrade full path →
+BM25-only → last good list → empty-but-valid (section 7).
+
+
+**Output contract.** `respond()` returns `message` as a string, `ask_attribute`
+as one allowed attribute or `null`, and `recommendations` **ordered best to
+worst** — the evaluator scores the first 10 valid unique `parent_asin` values in
+the order given, so position is the ranking. `usage` reports non-negative token
+counts and is all zeros in the submitted configuration, which calls no model.
+Verified live against `docs/agent_api_contract.json` across all four scenario
+types plus malformed input; see `tests/`.
+
 
 ### 4.1 Retrieval: BM25 gates, dense re-ranks (layers 1 and 4)
 
@@ -518,12 +565,21 @@ not ship: [`docs/simulator_prior.md`](docs/simulator_prior.md).
 
 ## 5. Model Choice — and why offline metrics did not decide it
 
+> **Scope.** This section chose the *learned re-ranker* (layer 5), and it is
+> the default whenever the optional dense track is on. It is **not on the
+> submitted path**: the submitted run sets `DENSE_ENABLED=0`, and the
+> re-ranker needs the dense track for its features, so it is loaded but never
+> runs. The reasoning is kept because the transfer failure it documents — the
+> offline metric being blind at exactly the tails a default is chosen from — is
+> the most useful thing we learned, and it is cited from section 6.
+
+
 We implemented seven ranking models on a shared interface and measured each
 with the official evaluator, all on the current first stage:
 
 | Model | Offline MRR (993 groups) | Evaluator | Note |
 |---|---|---|---|
-| **ranksvm (submitted)** | 0.9476 (2nd) | **0.84849** | pure numpy, no lightgbm |
+| **ranksvm (default)** | 0.9476 (2nd) | **0.84849** | pure numpy, no lightgbm |
 | simplex | 0.9398 (5th) | 0.84848 | degenerate single-feature solution |
 | coord_ascent | 0.9464 (3rd) | 0.84675 | |
 | mlp | 0.9444 (4th) | 0.84311 | 14-32-16-1, exported to numpy |
@@ -895,6 +951,7 @@ fallback guarantee about it.
 ## 10. Repository Map
 
 ```text
+record_run.py                        writes RUN_MANIFEST.md beside results.json
 starter/agent.py                     the Agent class (entry point)
 starter/simulator_prior.py           layer 8: the inverted simulator policy
 starter/reranker/                    re-ranker runtime code
@@ -905,11 +962,8 @@ starter/reranker/                    re-ranker runtime code
   artifacts_5k/                      SUBMITTED WEIGHTS (4,965-query training)
   artifacts_3k/, artifacts/          earlier weights, kept for comparison
 training/                            training scripts (dev only)
-notebooks/                           training and comparison notebooks
 tests/                               unit tests
 docs/simulator_prior.md              layers 8 and 9: derivation and measurements
-docs/reranker_eval_results.md        re-ranker experiment log
-docs/first_stage_ablation.md         first-stage, personalization, token budget
 evaluator/                           official evaluator - NEVER MODIFIED
 .gitattributes                       stops git corrupting model artifacts
 app.py, templates/index.html         Flask web UI

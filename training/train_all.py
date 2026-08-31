@@ -2,9 +2,9 @@
 evaluate each on a held-out group split, persist artifacts to
 starter/reranker/artifacts/, and derive ensemble thresholds.
 
-This is the script-form of notebooks/training_pipeline.ipynb -- the notebook
-walks through the same steps interactively with plots; this is the
-reproducible CLI entry point.
+This is the reproducible CLI entry point for the training pipeline. An
+exploratory notebook covering the same steps with plots was used during
+development and is not part of the submitted bundle.
 
 CLI:
     python -m training.train_all --data data/reranker_training_data.npz \

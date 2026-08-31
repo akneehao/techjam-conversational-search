@@ -1,22 +1,42 @@
-# Core (Day 1 BM25 + Day 3 clarification): Python standard library only.
+# ---------------------------------------------------------------------------
+# REPRODUCING THE SUBMITTED SCORE NEEDS NOTHING FROM THIS FILE.
 #
-# Day 2 -- LLM intent router: calls Google Gemini via the REST API using urllib
-#   (stdlib). Set GEMINI_API_KEY (see .env) to enable. No package needed.
+#   export AGENT_USE_LLM=0 DENSE_ENABLED=0
+#   python -m evaluator.local_evaluator --output results.json
+#   python record_run.py
 #
-# Day 4 -- dense retrieval track (optional). Without these the agent is pure BM25
-#   and scores exactly as Day 1-3.
-#   First run with network builds a local vector cache (data/dense_*.npz);
-#   subsequent runs are fully offline and in-memory.
+# Layers 1-3, 6, 8 and 9 are Python standard library only: sqlite3 for the FTS5
+# index, re/json/bisect/collections for tokenisation, the inverted simulator
+# script index, and the review-count percentile table. That path scores
+# TechnicalScore 0.8870 with zero tokens and no network. Python 3.10+; developed
+# on 3.12.6 and 3.13.14.
+#
+# Everything below is OPTIONAL and belongs to layers the submitted run switches
+# off. Install it only to enable those layers or to run the web UI.
+# ---------------------------------------------------------------------------
+
+# -- Layer 4, dense re-ranking (optional) -----------------------------------
+#    all-MiniLM-L6-v2 embeddings reorder the BM25 candidate set.
+#    WARNING: the first run encodes all 50,000 products. That took over an hour
+#    on our development laptop at ~12 documents/second. CPU-only torch is
+#    enough: pip install torch --index-url https://download.pytorch.org/whl/cpu
 numpy>=1.26
 sentence-transformers>=3.0
+
+# -- Layer 5, learned re-ranker (optional) ----------------------------------
+#    Needs layer 4 for its features, so DENSE_ENABLED=0 disables it too. The
+#    default ranksvm artifact is a 14-number weight vector scored with one numpy
+#    dot product; lightgbm is needed only for RERANK_MODEL=gbdt.
+lightgbm>=4.0
+
+# -- Layer 7, web UI (optional) ---------------------------------------------
+#    python app.py, then open http://localhost:5001
 Flask==2.2.5
 Werkzeug==2.2.3
-# CPU-only torch is enough:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-#
-# Day 5 -- learned re-ranking layer (optional). Without this (or with
-#   RERANK_ENABLED=0) the agent falls back to the Day 4 RRF-fused order.
-#   The linear/MLP rerankers need only numpy (already required above); the
-#   GBDT sub-model additionally needs lightgbm -- if unavailable, the
-#   ensemble degrades to MLP-only, then further to plain RRF.
-lightgbm>=4.0
+
+# -- Layer 2, Gemini intent router (optional) -------------------------------
+#    No package required: called over REST with stdlib urllib. Set GEMINI_API_KEY
+#    to enable. The submitted run sets AGENT_USE_LLM=0 and never calls it.
+
+# requirements-dev.txt is needed only to RE-TRAIN the re-ranker, never to
+# reproduce a score.
