@@ -164,13 +164,27 @@ def main() -> None:
     by_top: dict[str, list[str]] = defaultdict(list)
     for a in queryable:
         by_top[cat_index.path_by_asin[a][0]].append(a)
-    per_bucket = max(1, args.num_queries // max(1, len(by_top)))
+
+    # Proportional stratified sample with top-up. The catalog's top-level
+    # buckets are extremely unbalanced (49,990 vs 10), so an even per-bucket
+    # quota silently caps the sample far below --num-queries; allocate in
+    # proportion to bucket size, then redistribute whatever small buckets
+    # could not fill.
+    total = sum(len(v) for v in by_top.values())
+    target = min(args.num_queries, total)
     sampled: list[str] = []
+    leftovers: list[str] = []
     for _top, asins in by_top.items():
-        idx = rng.choice(len(asins), size=min(per_bucket, len(asins)), replace=False)
-        sampled.extend(asins[i] for i in idx)
-    query_list = sorted(sampled)[: args.num_queries]
-    print(f"Query set: {len(query_list)} products (stratified by top-level category)")
+        quota = min(len(asins), int(round(target * len(asins) / total)))
+        idx = rng.choice(len(asins), size=len(asins), replace=False)
+        sampled.extend(asins[i] for i in idx[:quota])
+        leftovers.extend(asins[i] for i in idx[quota:])
+    if len(sampled) < target and leftovers:
+        rng.shuffle(leftovers)
+        sampled.extend(leftovers[: target - len(sampled)])
+    query_list = sorted(sampled)[:target]
+    print(f"Query set: {len(query_list)} products (stratified by top-level category, "
+          f"{len(by_top)} buckets)")
 
     all_X: list[np.ndarray] = []
     all_y: list[int] = []
