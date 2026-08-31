@@ -1409,17 +1409,28 @@ class Agent:
         new_category = slots.get("category")
         new_category = new_category.strip().lower() if isinstance(new_category, str) and new_category.strip() else None
 
-        # Requirement 4: a genuine category change wipes the conflicting slots.
-        # Guard on "the LLM told us what to switch to" so a mis-fire on a mere
-        # preference swap can't erase a good category gate.
+        # Requirement 4: a genuine category change retires the old category gate.
+        #
+        # This used to also clear ``keywords`` and ``constraint_terms``, i.e. the
+        # entire accumulated constraint set.  That made a single false-positive
+        # ov=true catastrophic, and it is the measured reason the router lost
+        # ground on exactly the scenario it exists for: intent_override hit@10
+        # 0.967 -> 0.933 and MRR 0.743 -> 0.726 with the LLM on.
+        #
+        # The deterministic ``_ingest`` path handles the same message by
+        # PREPENDING the new requirement and keeping the old tokens, and scores
+        # better.  It is right to be conservative here: the evaluator blocks a
+        # hit only until the change is revealed, and stale tokens often still
+        # point at the target (the abandoned preference frequently names the
+        # product).  Retiring the category gate is enough to stop the old
+        # category dominating; erasing the evidence is not required.
         if route["override"] and new_category:
             for key in ("category", "style", "use_case"):
                 state["slots"][key] = None
-            state["keywords"] = []
             state["category_terms"] = []      # drop the abandoned category gate
-            state["constraint_terms"] = []    # and its now-stale constraint tokens
-            # colour / material / brand / budget slots survive (not category-bound);
-            # the LLM nulls them itself if it judged them stale.
+            # keywords / constraint_terms deliberately SURVIVE -- see above.
+            # colour / material / brand / budget slots survive too (not
+            # category-bound); the LLM nulls them itself if it judged them stale.
             state["profile_hits"] = None      # boost set was scoped to the old query
 
         for key in SLOT_KEYS:
