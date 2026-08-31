@@ -1,0 +1,17 @@
+# Trained model artifacts must never be line-ending converted.
+#
+# LightGBM ships its booster as a .txt file, so a Windows checkout with
+# core.autocrlf=true rewrites its ~2,000 newlines to CRLF.  LightGBM's parser
+# rejects that with a NATIVE abort ("Model format error, expect a tree here"),
+# which kills the interpreter -- it is not a Python exception, so the agent's
+# try/except fallbacks cannot catch it and Agent() dies at construction.
+# With RERANK_MODEL=gbdt as the default, that is a hard crash on a fresh
+# Windows clone.
+starter/reranker/artifacts*/*.txt  -text
+starter/reranker/artifacts*/*.json -text
+*.npz binary
+*.npy binary
+
+# Keep source normalised as usual.
+*.py text
+*.md text
