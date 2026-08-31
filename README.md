@@ -255,10 +255,12 @@ pure function of the lexical gate, and no learned component can cost a hit.
    strictest tier is `leaf_category AND at least two specific constraints`;
    broader tiers follow. Tiers are fused by weighted RRF. Field weights favour
    category (11.0), title (8.0) and a normalised keyword bag (8.0). The top
-   120 form the candidate set.
+   **120–200 form the candidate set** — the depth is set per turn by layer 6
+   (120 on the precision track, 200 on discovery).
 2. **Dense.** The conversation state is embedded and cosine-scored **against
-   those candidates only**, min-max normalised per turn, and blended under a
-   lexical rank prior that spans 1.0 → 0.085. Semantics reorder neighbours but
+   that candidate set only**, min-max normalised per turn, and blended under a
+   lexical rank prior that spans 1.0 → 0.085. The distilled profile then adds a
+   small `+0.05` tiebreak on top of that blend. Semantics reorder neighbours but
    cannot overturn a decisive lexical match.
 
 This replaced a symmetric RRF fusion of two 60-deep lists at `k=60`, which was
