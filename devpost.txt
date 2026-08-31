@@ -175,9 +175,8 @@ design, so we kept the feature and documented the trade-off.
 2. DEVELOPMENT TOOLS USED
 ----------------------------------------------------------------
   * Visual Studio Code - main editor
-  * Jupyter Notebook - training pipeline and model comparison,
-    with plots (notebooks/training_pipeline.ipynb,
-    notebooks/model_comparison.ipynb)
+  * Jupyter Notebook - used during development to build the
+    training pipeline and compare models with plots
   * Git and GitHub - version control and team collaboration
   * Claude Code (Anthropic) - AI pair-programming assistant used
     during development

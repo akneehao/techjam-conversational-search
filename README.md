@@ -564,7 +564,6 @@ starter/reranker/                    re-ranker runtime code
   artifacts_5k/                      SUBMITTED WEIGHTS (4,965-query training)
   artifacts_3k/, artifacts/          earlier weights, kept for comparison
 training/                            training scripts (dev only)
-notebooks/                           training and comparison notebooks
 tests/                               unit tests
 docs/reranker_eval_results.md        re-ranker experiment log
 docs/first_stage_ablation.md         first-stage, personalization, token budget
