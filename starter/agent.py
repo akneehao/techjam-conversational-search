@@ -17,6 +17,14 @@ try:
     from sentence_transformers import SentenceTransformer as _SentenceTransformer
 except ImportError:  # pragma: no cover
     _SentenceTransformer = None
+try:  # optional -- Day 5 learned re-ranking layer
+    from .reranker import load_reranker
+    from .reranker.catalog_index import build_category_index
+    from .reranker.features import compute_feature_matrix
+except ImportError:  # pragma: no cover
+    load_reranker = None
+    build_category_index = None
+    compute_feature_matrix = None
 
 
 # --------------------------------------------------------------------------- #
@@ -153,6 +161,35 @@ _DENSE_TEXT_VERSION = 2          # bump to invalidate cached vectors when doc te
 DENSE_ENCODE_BATCH = 256
 RRF_DEPTH = int(os.environ.get("RRF_DEPTH", "60"))   # top-N pulled from each track
 RRF_K = int(os.environ.get("RRF_K", "60"))           # the "60" in 1 / (60 + rank)
+
+# --------------------------------------------------------------------------- #
+# Day 5 -- learned re-ranking layer (optional)
+# --------------------------------------------------------------------------- #
+# Re-scores the top RERANK_CANDIDATES of the RRF-fused list with a small,
+# locally-trained ranker (see starter/reranker/ + training/). Fully optional:
+# with RERANK_ENABLED=0, missing artifacts, or a missing dependency, the
+# agent falls straight back to the plain RRF order -- identical to Day 4
+# behaviour. Never trains or calls any external service at serving time.
+#
+# ENABLED BY DEFAULT (GBDT). On the public set this is worth +0.0653
+# TechnicalScore over the plain RRF ordering -- 0.8260 vs. 0.7607 -- and it
+# improves every component metric: HitRate@10 0.955 vs 0.940, MRR 0.609 vs
+# 0.444, MTTC 2.71 vs 3.12.
+#
+# That only holds for the v2 training formulation. An earlier v1 (labels
+# built from category siblings, no first-stage retrieval features) scored
+# BELOW the plain RRF order for all 7 model types -- best 0.7006, worst
+# 0.3344. See docs/reranker_eval_results.md for the root cause (label
+# leakage into sibling_max_sim + a training task that was nearly the
+# opposite of the real one) and what changed. Only GBDT is trained on the
+# current 14-feature schema; other RERANK_MODEL values have no artifact and
+# fall back to the plain RRF order.
+RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "gbdt")
+RERANK_ARTIFACTS_DIR = Path(
+    os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts"))
+)
+RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "60"))
 
 # messages that carry no new constraint -- never worth an LLM call
 _NO_INFO_MARKERS = (
@@ -389,10 +426,15 @@ class Agent:
       * Day 4 -- a dense retrieval track (sentence-transformers, cached in-memory
         vectors).  Every turn runs BM25 and dense; the two ranked lists are
         combined by unconditional Reciprocal Rank Fusion.
+      * Day 5 -- an optional learned re-ranking layer (see starter/reranker/)
+        that re-scores the top of the RRF-fused list with a small locally
+        trained ranker.  Falls back to the plain Day 4 order if disabled,
+        untrained, or missing a dependency.
 
-    Every LLM / dense component is optional.  With no Gemini key and no
-    numpy/sentence-transformers (the offline final-scoring case the rules allow)
-    the agent is pure BM25 and behaves exactly as Day 1-3, ``usage`` all zeros.
+    Every LLM / dense / re-ranking component is optional.  With no Gemini key
+    and no numpy/sentence-transformers (the offline final-scoring case the
+    rules allow) the agent is pure BM25 and behaves exactly as Day 1-3,
+    ``usage`` all zeros.
     """
 
     def __init__(
@@ -417,8 +459,15 @@ class Agent:
         self._embedder = None
         self._doc_vecs = None              # (N, dim) float32, L2-normalised
         self._dense_ids: list[str] = []
+        self._catalog: dict[str, dict] = {}   # asin -> raw product dict, filled by _build_index
         self._build_index()
         self._init_dense(use_dense)
+        # re-ranking layer (Day 5)
+        self._cat_index = None
+        self._dense_id_row: dict[str, int] = {}
+        self._doc_tokens: dict[str, frozenset[str]] = {}
+        self._reranker = None
+        self._init_reranker()
 
     def _llm_on(self) -> bool:
         """True when the Gemini router is configured and hasn't hard-failed."""
@@ -452,6 +501,9 @@ class Agent:
                     product = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                asin = str(product.get("parent_asin") or "")
+                if asin:
+                    self._catalog[asin] = product
                 batch.append(_doc_row(product))
                 if len(batch) >= 2000:
                     cursor.executemany("INSERT INTO products VALUES (?,?,?,?,?,?,?,?)", batch)
@@ -521,6 +573,48 @@ class Agent:
             _np.savez(cache, ids=_np.array(ids, dtype=object), vecs=vecs)
         except OSError:
             pass  # read-only fs -> keep the in-memory vectors, just don't cache
+
+    # -- Day 5: learned re-ranking layer ------------------------------------ #
+    def _init_reranker(self) -> None:
+        """Best-effort setup of the category index + trained re-ranker.  Any
+        missing dependency, missing artifact, or unexpected error leaves
+        self._reranker as None -- respond() then behaves exactly like Day 4."""
+        if not RERANK_ENABLED or load_reranker is None or not self._dense_on():
+            return
+        try:
+            self._dense_id_row = {asin: i for i, asin in enumerate(self._dense_ids)}
+            self._cat_index = build_category_index(self._catalog, self._doc_vecs, self._dense_ids)
+            self._doc_tokens = {
+                asin: frozenset(_tokens(_dense_doc_text(product)))
+                for asin, product in self._catalog.items()
+                if asin in self._dense_id_row
+            }
+            self._reranker = load_reranker(RERANK_ARTIFACTS_DIR, model=RERANK_MODEL)
+        except Exception:
+            self._cat_index = None
+            self._doc_tokens = {}
+            self._reranker = None
+
+    def _rerank(
+        self, candidates: list[str], query_text: str,
+        bm25_ranked: list[str] | None = None, dense_ranked: list[str] | None = None,
+    ) -> list[str]:
+        if not candidates or self._reranker is None or self._cat_index is None:
+            return candidates
+        try:
+            raw = self._embedder.encode(
+                [query_text], convert_to_numpy=True, normalize_embeddings=False,
+            )[0].astype("float32")
+            q_norm = float(_np.linalg.norm(raw)) or 1.0
+            qv = (raw / q_norm).astype("float32")
+            X = compute_feature_matrix(
+                qv, q_norm, _tokens(query_text), candidates,
+                self._cat_index, self._doc_vecs, self._dense_id_row, self._doc_tokens,
+                bm25_ranked=bm25_ranked, dense_ranked=dense_ranked, rrf_k=RRF_K,
+            )
+            return self._reranker.rank(X, candidates)
+        except Exception:
+            return candidates
 
     def _dense_rank(self, query_text: str, top_n: int) -> list[str]:
         if not self._dense_on() or not query_text.strip():
@@ -975,7 +1069,14 @@ class Agent:
         #    (Dense list is empty -> this degrades to the pure BM25 ranking.)
         bm25_ranked = self._bm25_ranked(state)
         dense_ranked = self._dense_ranked(state, user_message)
-        fused = self._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=top_k)
+        fused = self._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=None)
+        if self._reranker is not None and fused:
+            head = self._rerank(
+                fused[:RERANK_CANDIDATES], self._dense_query_text(state, user_message),
+                bm25_ranked=bm25_ranked, dense_ranked=dense_ranked,
+            )
+            fused = head + fused[len(head):]
+        fused = fused[:top_k]
         recommendations = [{"parent_asin": asin} for asin in fused]
 
         if state["exhausted"]:

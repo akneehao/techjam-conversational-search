@@ -8,6 +8,13 @@ data/catalog.jsonl.gz
 data/releases/
 # Day 4 dense-retrieval vector cache (regenerated from the catalog).
 data/dense_*.npz
+# Day 5 re-ranker: regenerable training data / diagnostics (NOT the trained
+# artifacts in starter/reranker/artifacts/, which are small and checked in).
+data/reranker_training_data.npz
+data/reranker_synthetic_data.npz
+data/gemini_ood_queries.json
+training/evaluation_summary.json
+results_*.json
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
 secure/
@@ -19,3 +26,6 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+tiktokEnv
+data\SHA256SUMS
+.pg

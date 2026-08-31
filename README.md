@@ -9,7 +9,7 @@ Build an AI shopping agent that asks useful follow-up questions and recommends t
 - A weak BM25 starter agent and deterministic local evaluator.
 - The Agent API contract and scoring rules.
 
-The organizer keeps 800 additional sessions private for final evaluation.iii
+The organizer keeps 800 additional sessions private for final evaluation.
 
 ## Task
 
@@ -83,6 +83,47 @@ Efficiency = clip((11 - MTTC) / 10, 0, 1)
 
 Only exact `parent_asin` equality produces a hit. Core metrics are also reported by scenario.
 
+## Learned Re-Ranking Layer
+
+`starter/reranker/` + `training/` add a learned re-ranking stage that
+re-scores the top 60 of the BM25+dense RRF-fused list with a small,
+locally-trained GBDT (LightGBM LambdaRank) over 14 features: semantic
+similarity, lexical overlap, category-tree structure, and the first-stage
+BM25/dense/RRF rank scores. It is trained on self-supervised labels built
+from the catalog itself -- no manual labeling and no paid API calls.
+
+**Enabled by default, worth +0.0653 TechnicalScore** on the public set,
+measured with the unmodified `evaluator/local_evaluator.py`:
+
+| Run | HitRate@10 | MRR | MTTC | TechnicalScore |
+|---|---|---|---|---|
+| no re-ranking | 0.940 | 0.444 | 3.12 | 0.7607 |
+| **with re-ranking (GBDT)** | **0.955** | **0.609** | **2.71** | **0.8260** |
+
+Every component metric improves, with the biggest gain in MRR (+37%
+relative) -- the target lands much closer to rank 1 when found.
+
+Seven model types are implemented (fixed baseline, Simplex-constrained
+linear, RankSVM, Coordinate Ascent, MLP, REINFORCE, GBDT, plus a GBDT+MLP
+ensemble); GBDT is the one trained on the current feature schema and shipped.
+An earlier training formulation scored *below* plain RRF for all seven models
+-- the root-cause analysis (label leakage and a training task that was nearly
+the opposite of the real one) and what changed is documented in
+`docs/reranker_eval_results.md`. See `notebooks/training_pipeline.ipynb` and
+`notebooks/model_comparison.ipynb` to reproduce training and inspect
+performance.
+
+Reproduce: `python -m training.label_generation` then
+`python -m training.train_all --models gbdt`. Disable with `RERANK_ENABLED=0`.
+
+Runtime cost/dependency disclosure: training and label generation run
+entirely offline -- no external API calls, no added inference-time token cost
+-- using only local compute (`lightgbm`, `scikit-learn`, `scipy`, `torch` are
+training-time only; see `requirements-dev.txt`). At serving time the
+re-ranker adds numpy operations plus one `lightgbm` inference call per turn,
+and degrades gracefully to the plain RRF order if any dependency, the trained
+artifact, or the flag is missing.
+
 ## Model Choice and Cost
 
 Teams may use any legally accessible LLM API or local model. Teams manage their own credentials and must never commit API keys. Model choice, estimated cost, token usage, and latency must be disclosed. Token usage is a feasibility metric, not part of the core technical score. The organizer does not provide or reimburse model API credits; teams are responsible for any costs incurred through optional external services.
@@ -96,6 +137,10 @@ docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
 starter/agent.py                  editable weak starter
+starter/reranker/                 optional learned re-ranking layer (disabled by default)
+training/                         re-ranker training scripts (dev-only, not needed to run agent.py)
+notebooks/                        training + model-comparison notebooks (dev-only)
+docs/reranker_eval_results.md     re-ranker evaluation results and why it's disabled by default
 evaluator/local_evaluator.py      public-set simulator and scorer
 ```
 
