@@ -9,7 +9,9 @@ Build an AI shopping agent that asks useful follow-up questions and recommends t
 - A weak BM25 starter agent and deterministic local evaluator.
 - The Agent API contract and scoring rules.
 
-The organizer keeps 800 additional sessions private for final evaluation.
+The organizer keeps 800 additional sessions unreleased until the Devpost submission deadline. After the deadline, the final evaluation package will be released and teams will run the unmodified official evaluator in their own environments using their frozen submitted commit.
+
+See [`docs/final_evaluation_faq.md`](docs/final_evaluation_faq.md) for the final evaluation, network, credentials, hardware, data, and scoring policy.
 
 ## Task
 
@@ -92,27 +94,26 @@ first-stage BM25/dense/RRF rank scores. It is trained on self-supervised
 labels built from the catalog itself -- no manual labeling and no paid API
 calls.
 
-**Enabled by default, worth +0.0803 TechnicalScore** on the public set,
+**Enabled by default, worth +0.0811 TechnicalScore** on the public set,
 measured with the unmodified `evaluator/local_evaluator.py`:
 
 | Configuration | HitRate@10 | MRR | MTTC | TechnicalScore |
 |---|---|---|---|---|
-| **simplex (default)** | 0.960 | **0.649** | 2.68 | **0.8410** |
-| mlp | **0.965** | 0.624 | **2.67** | 0.8362 |
-| gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
-| coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
-| ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
+| simplex | **0.970** | 0.640 | 2.65 | **0.8440** |
+| **gbdt (default)** | 0.960 | **0.649** | 2.65 | 0.8418 |
+| mlp | 0.965 | 0.627 | **2.63** | 0.8380 |
 | no re-ranking | 0.940 | 0.444 | 3.12 | 0.7607 |
 
 Every trained model beats the plain RRF ordering on every component metric,
-with the biggest gain in MRR (+46% relative for the default) -- the target
-lands much closer to rank 1 when found. The default is the simplex-constrained
-linear model: it scored highest here, and its artifact is an 11-number weight
-vector scored with a single numpy dot product, so the default serving path
-needs no lightgbm, torch, scipy or sklearn. Any other model is selectable with
-`RERANK_MODEL=<name>`; note the top three sit within ~0.015 of each other on a
-200-session sample, so see `docs/reranker_eval_results.md` before reading much
-into that ordering.
+with the biggest gain in MRR (+46% relative) -- the target lands much closer
+to rank 1 when found. The shipped model is GBDT trained on the 3,000-query
+set (`starter/reranker/artifacts_3k/`); simplex scores 0.0022 higher but
+converges to a degenerate single-feature solution (`lexical_score` = 1.0, all
+others 0.0), so GBDT is preferred for robustness on the private sessions. Any
+model is selectable with `RERANK_MODEL=<name>`, and
+`RERANK_ARTIFACTS_DIR=starter/reranker/artifacts` selects the older
+751-query models. See `docs/reranker_eval_results.md` for the full comparison
+and caveats.
 
 Seven model types are implemented (fixed baseline, Simplex-constrained
 linear, RankSVM, Coordinate Ascent, MLP, REINFORCE, GBDT, plus a GBDT+MLP
@@ -145,6 +146,7 @@ Teams may use any legally accessible LLM API or local model. Teams manage their 
 ```text
 data/public_set.jsonl             200 labeled development sessions
 docs/competition_specification.md participant rules and evaluation protocol
+docs/final_evaluation_faq.md      final evaluation and judging clarifications
 docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
@@ -159,9 +161,7 @@ evaluator/local_evaluator.py      public-set simulator and scorer
 ## Judging and Submission Policy
 
 - Participant submission requirements: `docs/submission_rules.md`
-- Organizer-only final judging controls: `organizer/JUDGING_RUNBOOK.md`
-- Organizer private release checklist: `organizer/private_release_checklist.md`
-- Judging day operations SOP: `organizer/JUDGING_DAY_SOP.md`
+- Final evaluation FAQ: `docs/final_evaluation_faq.md`
 
 ## Data Source
 

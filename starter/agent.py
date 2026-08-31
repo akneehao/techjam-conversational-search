@@ -326,13 +326,49 @@ CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
 # field-weighted, while `lexical_score` is raw query-token *coverage*, and the
 # two signals add.  Measuring the layer against a broken control understated
 # what it contributes.
+#
+# DEFAULT MODEL: gbdt on the 3,000-query set (reranker/artifacts_3k).  On the
+# old RRF stage: gbdt 0.8418, simplex 0.8440, mlp 0.8380.  Simplex nominally
+# scores 0.0022 higher -- under one session on a 200-session set -- but gbdt is
+# the deliberate pick: simplex converges to a degenerate single-feature
+# solution (lexical_score = 1.0, all 13 other weights exactly 0.0, at BOTH
+# training sizes), while gbdt uses the full feature set and wins on the
+# 594-group offline test set, which has more statistical power.
+#
+# NOTE: one of the original arguments for gbdt was that simplex "has no
+# graceful behaviour if the hidden sessions paraphrase rather than quote
+# product wording".  The final-evaluation FAQ (S1) has since settled that --
+# the private sessions use the same deterministic templates and "no
+# undisclosed natural-language paraphrases are introduced" -- so that
+# particular risk is gone.  The offline-test-set argument still stands.
 # See docs/first_stage_ablation.md and docs/reranker_eval_results.md.
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "simplex")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "gbdt")
 RERANK_ARTIFACTS_DIR = Path(
-    os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts"))
+    os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts_3k"))
 )
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "60"))
+
+# -- Day 5b: personalized context distillation ----------------------------- #
+# The aggregate ``user_profile`` is distilled once per session in ``reset()``.
+# PROFILE_INJECT decides whether those distilled tags may reach *retrieval*:
+#   0 (default) -- never. The profile only conditions how the router reads a
+#                  message; it cannot add or remove candidates.
+#   1           -- inject only tags outside GENERIC (performance/warmth/...).
+#   2           -- inject every tag, i.e. the literal "append the profile to
+#                  the search constraints" reading.
+# Measured on the 200 public sessions, GENERIC already covers 91% of all tag
+# occurrences (fit 82%, material 77%, comfort 72%, style 50%, durability 24%),
+# so level 2 mostly feeds high-frequency noise to the query builder. Levels 1
+# and 2 exist to make that claim measurable rather than assumed.
+#
+# This is the escape hatch for the boost lane described above.  The default
+# (0) keeps the profile out of retrieval entirely and lets it act only through
+# the PROFILE_WEIGHT re-rank tiebreak; levels 1 and 2 exist so "just append the
+# profile to the search constraints" is a measurable claim rather than an
+# assumed one.  ``_distill_profile`` supplies both tag sets.
+PROFILE_INJECT = int(os.environ.get("PROFILE_INJECT", "0") or 0)
+
 
 # messages that carry no new constraint -- never worth an LLM call
 _NO_INFO_MARKERS = (
@@ -355,6 +391,9 @@ _ROUTER_SYSTEM = (
     "kw: <=6 other constraint words not covered by a slot.\n"
     "ov: true ONLY if the customer abandons the stated product CATEGORY for a different "
     "one. A changed color/material/size/fit is NOT ov.\n"
+    "PROFILE describes what the shopper's PAST purchases emphasised. It is background, "
+    "NOT a request: never copy it into sl or kw. Use it only to disambiguate wording "
+    "in THIS message.\n"
     "pf: <=2 concrete product attributes implied by PROFILE that fit this request "
     "(e.g. 'dark colors'). [] if PROFILE is generic (fit/comfort/style/material/durability) "
     "or conflicts with the request. Never invent."
@@ -576,27 +615,30 @@ def _split_first_message(low: str) -> tuple[str, str]:
 def _distill_profile(user_profile: object) -> dict:
     """Distill the aggregate `user_profile` into prompt text + boost terms.
 
-    Returns ``{"tags", "summary", "terms", "line"}``:
-      * ``tags``    -- raw preference tags, kept for disclosure / explanations.
-      * ``summary`` -- the profile summary string, trimmed.
-      * ``terms``   -- the *discriminating* subset, used only for the soft
+    Returns ``{"tags", "salient_tags", "summary", "rating_style", "terms", "line"}``:
+      * ``tags``         -- raw preference tags, for disclosure / explanations.
+      * ``salient_tags`` -- tags outside GENERIC, single-word (PROFILE_INJECT).
+      * ``summary``      -- the profile summary string, trimmed.
+      * ``rating_style`` -- e.g. "critical" / "usually positive".
+      * ``terms``        -- the *discriminating* subset, used only for the soft
         re-rank boost.  Anything in ``GENERIC`` or ``STOPWORDS`` is dropped:
         fit / comfort / material / style / durability describe ~every apparel
         product (and appear in 24-82% of sessions), so boosting on them is a
         no-op at best and a systematic bias at worst.
-      * ``line``    -- one compact line for the LLM prompt (bounded length, so
-        a verbose profile cannot inflate prompt tokens).
+      * ``line``         -- one compact line for the LLM prompt.
 
     Never raises: a malformed or missing profile distills to an empty result and
     the agent behaves exactly as if personalization were disabled.
     """
-    empty = {"tags": [], "summary": "", "terms": [], "line": ""}
+    empty = {"tags": [], "salient_tags": [], "summary": "", "rating_style": "",
+             "terms": [], "line": ""}
     if not PROFILE_ENABLED or not isinstance(user_profile, dict):
         return empty
     try:
         raw_tags = user_profile.get("preference_tags")
         tags = [str(t).strip().lower() for t in raw_tags if str(t).strip()] if isinstance(raw_tags, list) else []
         summary = str(user_profile.get("summary") or "").strip()
+        rating_style = str(user_profile.get("rating_style") or "").strip()
 
         terms: list[str] = []
         for tag in tags:
@@ -605,14 +647,18 @@ def _distill_profile(user_profile: object) -> dict:
                     terms.append(token)
         terms = _dedupe(terms)[:PROFILE_MAX_TERMS]
 
-        # Only the discriminating part is worth prompt tokens; a summary that is
-        # just the generic tags restated adds nothing the router can act on.
-        line = ", ".join(terms)
-        if summary and terms:
-            line = f"{line} ({summary[:120]})"
-        elif summary:
-            line = summary[:120]
-        return {"tags": tags, "summary": summary, "terms": terms, "line": line[:180]}
+        # Only the discriminating terms travel to the router.  ``summary`` is
+        # itself generated from the same tags ("Prior purchases emphasize
+        # material, fit; ..."), so sending both would spend prompt tokens
+        # restating what the tags already say.
+        return {
+            "tags": tags,
+            "salient_tags": [t for t in tags if t not in GENERIC and " " not in t],
+            "summary": summary,
+            "rating_style": rating_style,
+            "terms": terms,
+            "line": ", ".join(terms)[:180],
+        }
     except Exception:
         return empty
 
@@ -1082,6 +1128,11 @@ class Agent:
         state = self._new_state()
         state["profile"] = _distill_profile(user_profile)
         state["profile_terms"] = list(state["profile"]["terms"])
+        if PROFILE_INJECT:
+            # Opt-in third route: let the distilled tags reach the FTS query
+            # builder as keywords.  Off by default -- see PROFILE_INJECT.
+            key = "tags" if PROFILE_INJECT >= 2 else "salient_tags"
+            state["keywords"] = list(state["profile"][key])
         self._state[session_id] = state
 
     # -- per-turn ingestion of the simulated customer's message -------------- #

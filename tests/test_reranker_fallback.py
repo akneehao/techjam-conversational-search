@@ -8,10 +8,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from starter.agent import Agent
+from starter.agent import RERANK_ARTIFACTS_DIR, Agent
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_ARTIFACTS_DIR = _REPO_ROOT / "starter" / "reranker" / "artifacts"
+# Track whatever agent.py actually ships as the default artifact set, so these
+# tests follow the default rather than a hard-coded folder.
+_ARTIFACTS_DIR = RERANK_ARTIFACTS_DIR
 _CATALOG_PATH = _REPO_ROOT / "data" / "catalog.jsonl"
 _HAS_TRAINED_ARTIFACTS = _ARTIFACTS_DIR.joinpath("gbdtranker.txt").is_file() and _CATALOG_PATH.is_file()
 

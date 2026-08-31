@@ -208,28 +208,26 @@ def main() -> None:
     by_top: dict[str, list[str]] = defaultdict(list)
     for a in queryable:
         by_top[cat_index.path_by_asin[a][0]].append(a)
-    # Stratify by top-level category, then redistribute the shortfall.
-    #
-    # A flat `num_queries // len(by_top)` per bucket silently under-delivers
-    # whenever the buckets are uneven, and this catalog is extremely uneven:
-    # two top-level nodes sized 10 and 49,990.  Asking for 2,500 used to yield
-    # 1,260 (10 from the small bucket + 1,250 from the large one) -- roughly
-    # half the requested set, with no warning.  Small buckets are still taken
-    # whole (that is the point of stratifying), but their unused quota now
-    # flows to buckets that still have products left, so --num-queries means
-    # what it says.
-    remaining = args.num_queries
-    buckets = sorted(by_top.items(), key=lambda kv: len(kv[1]))  # smallest first
+    # Proportional stratified sample with top-up. The catalog's top-level
+    # buckets are extremely unbalanced (49,990 vs 10), so an even per-bucket
+    # quota silently caps the sample far below --num-queries; allocate in
+    # proportion to bucket size, then redistribute whatever small buckets
+    # could not fill.
+    total = sum(len(v) for v in by_top.values())
+    target = min(args.num_queries, total)
     sampled: list[str] = []
-    for position, (_top, asins) in enumerate(buckets):
-        share = max(1, remaining // (len(buckets) - position))
-        take = min(share, len(asins))
-        idx = rng.choice(len(asins), size=take, replace=False)
-        sampled.extend(asins[i] for i in idx)
-        remaining -= take
-    query_list = sorted(sampled)[: args.num_queries]
+    leftovers: list[str] = []
+    for _top, asins in by_top.items():
+        quota = min(len(asins), int(round(target * len(asins) / total)))
+        idx = rng.choice(len(asins), size=len(asins), replace=False)
+        sampled.extend(asins[i] for i in idx[:quota])
+        leftovers.extend(asins[i] for i in idx[quota:])
+    if len(sampled) < target and leftovers:
+        rng.shuffle(leftovers)
+        sampled.extend(leftovers[: target - len(sampled)])
+    query_list = sorted(sampled)[:target]
     print(f"Query set: {len(query_list)} products (stratified by top-level category, "
-          f"{len(buckets)} buckets)")
+          f"{len(by_top)} buckets)")
 
     all_X: list[np.ndarray] = []
     all_y: list[int] = []
