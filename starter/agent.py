@@ -144,6 +144,14 @@ _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:g
 # fall back to the deterministic parser.
 _LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "8.0"))
 LLM_MAX_CALLS_PER_SESSION = int(os.environ.get("LLM_MAX_CALLS_PER_SESSION", "6"))
+# Client-side pacing: minimum seconds between router calls. 0.0 (default) = off,
+# which is right for a paid key and for single-session interactive use.
+# A free-tier key is limited to ~15 requests/minute, and a batch evaluator run
+# issues them as fast as it can -- so an unpaced 200-session run trips HTTP 429
+# within ~16 calls.  Backing off after the failure works (see
+# ``_note_llm_failure``) but burns a wasted call each time; pacing avoids the
+# 429 entirely.  Set LLM_MIN_INTERVAL=4.5 for a free-tier batch run (~13 rpm).
+LLM_MIN_INTERVAL = float(os.environ.get("LLM_MIN_INTERVAL", "0.0"))
 
 SLOT_KEYS = ("category", "gender", "color", "material", "style", "brand", "use_case", "budget")
 
@@ -235,6 +243,37 @@ LEX_K = int(os.environ.get("LEX_K", "10"))                 # rank prior: 1 / (LE
 # dense may move an item by at most this much; the lexical prior spans 1.0->0.09,
 # so semantics reorder locally without overturning a strong exact-phrase match.
 DENSE_WEIGHT = float(os.environ.get("DENSE_WEIGHT", "0.25"))
+
+# --------------------------------------------------------------------------- #
+# Pillar I -- dual-track routing (heterogeneous weights + dynamic truncation)
+# --------------------------------------------------------------------------- #
+# "Instantly detect the user's underlying intent -- triggering a high-precision
+# filter track for targeted Buying to lock hard constraints, and a diverse dense
+# retrieval track for open-ended Browsing to unlock cross-category scenario
+# matching."
+#
+# A single uniform DENSE_WEIGHT is the wrong answer for BOTH tracks, and the
+# per-scenario numbers say why:
+#
+#     scenario    HitRate@10   MRR
+#     browsing      1.000      0.674   <- recall already saturated; needs ranking
+#     buying        0.925      0.650   <- needs the constraint gate, not diversity
+#
+# Browsing has perfect recall and mediocre ordering, which is exactly where
+# semantic similarity earns its place.  Buying needs the lexical gate to hold.
+# Measuring dense applied UNIFORMLY to both (-0.001) therefore understated it on
+# one track and overstated it on the other.
+#
+# The two tracks differ in both levers the brief names -- weight and truncation:
+#   * buying   : low dense weight, tight candidate pool -> precision
+#   * browsing : high dense weight, wide candidate pool -> diversity / recall
+DENSE_WEIGHT_BUYING = float(os.environ.get("DENSE_WEIGHT_BUYING", "0.10"))
+DENSE_WEIGHT_BROWSING = float(os.environ.get("DENSE_WEIGHT_BROWSING", "0.45"))
+RERANK_DEPTH_BROWSING = int(os.environ.get("RERANK_DEPTH_BROWSING", "200"))
+# Pillar III -- adaptive orchestration: when the constraint set stops moving and
+# the shopper is not converging, escalate to a wider, more semantic pass.
+RECOVERY_STALE_TURNS = int(os.environ.get("RECOVERY_STALE_TURNS", "2"))
+DUAL_TRACK_ENABLED = os.environ.get("DUAL_TRACK_ENABLED", "1") not in ("0", "false", "False")
 
 # Legacy symmetric-RRF constants (FUSION_MODE=rrf only).  RRF_K is deliberately
 # NOT 60 here: with a 60-deep list, k=60 is the flattest possible setting.  k=10
@@ -601,7 +640,9 @@ class Agent:
       * Day 4 -- a dense track (sentence-transformers, cached in-memory vectors).
       * Day 5 -- personalized context distillation from the aggregate profile,
         semantic RE-RANKING in place of symmetric fusion, a token / latency
-        budget, and an optional learned re-ranking layer (starter/reranker/).
+        budget, an optional learned re-ranking layer (starter/reranker/), and
+        dual-track routing with runtime re-orchestration (``_select_strategy``:
+        precision / discovery / recovery).
 
     Design rule that ties Day 5 together: **only BM25 may decide which documents
     are candidates.**  The LLM, the dense model, the optional cross-encoder and
@@ -640,6 +681,7 @@ class Agent:
         self._llm_broken = False           # permanent trip (auth / bad request only)
         self._llm_fail_streak = 0          # consecutive transient failures
         self._llm_cooldown_until = 0.0     # transient backoff deadline (monotonic)
+        self._llm_last_call = 0.0          # for LLM_MIN_INTERVAL pacing
         self._route_cache: dict[tuple, dict] = {}
         self.llm_usage_total = {"prompt_tokens": 0, "completion_tokens": 0}  # for disclosure
         # dense track (Day 4) / semantic re-ranker (Day 5)
@@ -1018,6 +1060,7 @@ class Agent:
             # ---- budgets / recovery (Day 5) ---------------------------------
             "llm_calls": 0,
             "last_ranked": [],         # last non-empty result list, for recovery
+            "track": None,             # retrieval track chosen this turn (Pillar I/III)
         }
 
     def reset(self, session_id: str, user_profile: dict) -> None:
@@ -1149,6 +1192,12 @@ class Agent:
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "generationConfig": generation_config,
         }).encode("utf-8")
+
+        if LLM_MIN_INTERVAL > 0.0:      # stay under a free-tier requests/minute cap
+            wait = self._llm_last_call + LLM_MIN_INTERVAL - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        self._llm_last_call = time.monotonic()
 
         url = _GEMINI_URL.format(model=self._llm_model) + "?key=" + self._llm_key
         request = urllib.request.Request(
@@ -1352,6 +1401,58 @@ class Agent:
         order = sorted(scores, key=lambda d: scores[d], reverse=True)
         return order[:top_k] if top_k else order
 
+    def _select_strategy(self, state: dict) -> dict:
+        """Pick this turn's retrieval strategy from the live session state.
+
+        Pillar I (dual-track routing) + Pillar III (adaptive orchestration).
+        The workflow is re-orchestrated per turn rather than fixed at startup:
+        the detected intent chooses the track, and accumulated evidence that the
+        current track is not converging escalates to a recovery pass.
+
+        Returns ``{"track", "dense_weight", "depth"}`` and records it on the
+        session as ``state["track"]`` (the response contract sets
+        ``additionalProperties: false``, so it cannot be returned to the caller;
+        it is kept on the state for the demo, logs and tests).
+
+          * precision (buying)   -- low dense weight, tight pool.  Hard
+            constraints must hold; semantics only break ties.
+          * discovery (browsing) -- high dense weight, wide pool.  Recall is
+            already saturated here, so ranking and cross-category reach are
+            what is left to win.
+          * recovery             -- the constraint set has been unchanged for
+            RECOVERY_STALE_TURNS and the shopper still has not converged.  The
+            current track is not working, so widen the pool and lean semantic;
+            this pairs with the tier rotation in ``_build_queries``.
+        """
+        if not DUAL_TRACK_ENABLED:
+            strategy = {"track": "uniform", "dense_weight": DENSE_WEIGHT, "depth": RERANK_DEPTH}
+            state["track"] = strategy["track"]
+            return strategy
+
+        buying = state.get("intent") == "buying"
+        if buying:
+            strategy = {
+                "track": "precision",
+                "dense_weight": DENSE_WEIGHT_BUYING,
+                "depth": RERANK_DEPTH,
+            }
+        else:
+            strategy = {
+                "track": "discovery",
+                "dense_weight": DENSE_WEIGHT_BROWSING,
+                "depth": RERANK_DEPTH_BROWSING,
+            }
+
+        if state.get("stale", 0) >= RECOVERY_STALE_TURNS:
+            strategy = {
+                "track": "recovery",
+                "dense_weight": min(0.60, strategy["dense_weight"] + 0.20),
+                "depth": max(strategy["depth"], RERANK_DEPTH_BROWSING),
+            }
+
+        state["track"] = strategy["track"]
+        return strategy
+
     def _rank(self, state: dict, user_message: str, top_k: int) -> list[str]:
         """Produce the final ranked ids for this turn.
 
@@ -1381,7 +1482,11 @@ class Agent:
                 fused, query_text, bm25_ranked, dense_ranked, top_k
             )
 
-        candidates = self._bm25_ranked(state, RERANK_DEPTH)
+        # Pillar I/III -- this turn's track decides both levers below.
+        strategy = self._select_strategy(state)
+        dense_weight, depth = strategy["dense_weight"], strategy["depth"]
+
+        candidates = self._bm25_ranked(state, depth)
         if not candidates:
             return []
         if self._fusion_mode == "bm25":
@@ -1393,13 +1498,13 @@ class Agent:
 
         # 2. semantic re-rank, scored over the candidates only
         dense_ranked: list[str] = []
-        if DENSE_WEIGHT > 0.0 and self._dense_on():
+        if dense_weight > 0.0 and self._dense_on():
             dense_scores = self._dense_scores(candidates, query_text)
             # a dense ordering restricted to the candidates -- feeds both the
             # blend below and the learned layer's dense_rank_score feature
             dense_ranked = sorted(dense_scores, key=lambda a: dense_scores[a], reverse=True)
             for asin, sem in self._minmax(dense_scores).items():
-                scores[asin] += DENSE_WEIGHT * sem
+                scores[asin] += dense_weight * sem
             if self._cross_encoder is not None:
                 for asin, cross in self._minmax(self._cross_scores(candidates, query_text)).items():
                     scores[asin] += CROSS_WEIGHT * cross
