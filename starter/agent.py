@@ -125,12 +125,54 @@ BM25_WEIGHTS = (0.0, 8.0, 11.0, 5.0, 3.0, 1.0, 1.5, 8.0)
 # The key is read from GEMINI_API_KEY / GOOGLE_API_KEY (see .env).  When no key /
 # no network is available the agent falls back to the deterministic parser -- the
 # submission rules allow network to be disabled during official scoring.
+#
+# Day 5 -- token / latency budget (feasibility measures, spec section "Innovation
+# Directions": *low latency and low token cost*).  Measured on a representative
+# mid-conversation turn, chars/4 estimate:
+#   * terse system prompt      302 -> 217 tok   (-28%)
+#   * short JSON keys (reply)   59 ->  46 tok   (-22%)
+#   * per call, all in         421 -> 313 tok   (-26%)
+#   * per session, with the call budget below:  ~4210 -> ~1880 tok  (-55%)
+# Plus LLM_MAX_TOKENS sized to the actual reply and a hard per-session call cap,
+# so a pathological session cannot run away on either cost or latency.
 LLM_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
-LLM_MAX_TOKENS = 512
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "192"))
 _GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-_LLM_TIMEOUT = 20.0
+# 20s x 10 turns x 200 sessions is a latency catastrophe on a flaky link; the
+# router reply is ~80 tokens, so a slow call is a dead call -- cut it early and
+# fall back to the deterministic parser.
+_LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "8.0"))
+LLM_MAX_CALLS_PER_SESSION = int(os.environ.get("LLM_MAX_CALLS_PER_SESSION", "6"))
 
 SLOT_KEYS = ("category", "gender", "color", "material", "style", "brand", "use_case", "budget")
+
+# --------------------------------------------------------------------------- #
+# Day 5 -- personalized context distillation (safe aggregate-profile use)
+# --------------------------------------------------------------------------- #
+# `reset()` receives the session's aggregate `user_profile`:
+#     {"preference_tags": [...], "summary": str, "average_prior_rating": float,
+#      "purchase_frequency": str, "rating_style": str}
+#
+# We distill it once per session into (a) a compact prompt line for the router
+# and (b) a filtered token list used ONLY as a soft re-rank boost.
+#
+# WHY THE BOOST LANE IS SEPARATE FROM THE QUERY GATE
+# --------------------------------------------------
+# Measured over the 200 public sessions, `preference_tags` is close to constant:
+#     fit 82% | material 77% | comfort 72% | style 50% | durability 24%
+# Those five are already in ``GENERIC`` -- they describe every apparel product in
+# the catalog, and they come from the shopper's *prior* purchases, which the
+# evaluator never links to the target item.  AND-ing them into the FTS query, or
+# even OR-ing them into the recall net, injects noise into 100% of sessions.
+#
+# So the profile never touches retrieval.  It contributes a small additive
+# tiebreak among items the lexical gate already selected -- personalization that
+# can reorder, but can never lose the target.  Rare, genuinely discriminating
+# tags ("warmth", "weather", "performance") survive the filter and do the work.
+PROFILE_ENABLED = os.environ.get("PROFILE_ENABLED", "1") not in ("0", "false", "False")
+# how much a profile match may move an item (final scores are ~1.0 .. 0.09)
+PROFILE_WEIGHT = float(os.environ.get("PROFILE_WEIGHT", "0.05"))
+PROFILE_MAX_TERMS = 6
 
 # Day 3: when the query is this broad and the shopper has given no discriminating
 # constraint, ask a clarifying question instead of returning 10 near-random hits.
@@ -145,52 +187,106 @@ CLARIFY_ENABLED = os.environ.get("CLARIFY_ENABLED", "0") not in ("0", "false", "
 CLARIFY_PRIORITY = ("category", "color", "material", "style", "use_case", "budget")
 
 # --------------------------------------------------------------------------- #
-# Day 4 -- dense retrieval track (sentence-transformers) + hybrid RRF fusion
+# Day 4/5 -- dense retrieval track (sentence-transformers) + semantic re-ranking
 # --------------------------------------------------------------------------- #
 # Optional: needs `numpy` + `sentence-transformers`.  Without them (or with
 # DENSE_ENABLED=0) the agent is pure BM25 and scores exactly as Day 1-3.
 #
-# Fusion is UNCONDITIONAL: every turn runs both tracks and combines them with
-# textbook Reciprocal Rank Fusion -- take the top RRF_DEPTH from each list and
-# add 1 / (RRF_K + rank) per appearance, equal weight.  (Measured cost vs. the
-# pure-BM25 0.840 baseline: see the Day 4 notes / eval table.)
+# DAY 5 CHANGE -- dense is a RE-RANKER, no longer a peer retriever.
+# ----------------------------------------------------------------
+# Day 4 fused two equal-length (60) ranked lists with symmetric RRF at k=60.
+# That is degenerate, in two provable ways:
+#
+#   1. k == depth flattens the curve.  rank 1 scores 1/61 = .01639 and rank 60
+#      scores 1/120 = .00833 -- a 1.97x span.  A document ranked LAST in both
+#      lists (2/120 = .01667) therefore outranks the #1 BM25 hit that dense
+#      missed (.01639).  Fusion had collapsed into a co-occurrence vote.
+#   2. Symmetric weights + equal depth make the fused order an exact rank-merge,
+#      so the top-10 was BM25[1..5] interleaved with DENSE[1..5].  Dense was
+#      silently evicting half of the top-10 -- and its picks bypassed the tiered
+#      category gate in ``_build_queries`` entirely.  With HitRate@10 at 0.50 of
+#      TechnicalScore and the target usually in BM25 ranks 3-20, that is the
+#      single largest scoring leak in the Day 4 agent.
+#
+# It is also the wrong prior for this task.  The evaluator builds the shopper's
+# constraints by copying verbatim substrings out of the target product's own
+# features/details, so the shopper literally quotes the target document: this is
+# known-item LEXICAL retrieval with exactly one relevant doc in 50,000.  BM25
+# owns that; a bi-encoder over 50k near-duplicate apparel items cannot separate
+# them (every cotton tee sits at cosine ~0.8).
+#
+# So: BM25 alone decides WHICH documents are candidates (recall is preserved
+# exactly -- dense can never inject a doc the gate rejected), and dense only
+# reorders WITHIN them.  Scores are min-max normalised per turn and blended, so
+# a slam-dunk lexical match keeps its lead instead of being flattened to 1/61.
 DENSE_ENABLED = os.environ.get("DENSE_ENABLED", "1") not in ("0", "false", "False")
 DENSE_MODEL = os.environ.get("DENSE_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 DENSE_CACHE_DIR = Path(os.environ.get("DENSE_CACHE_DIR", "data"))
 _DENSE_TEXT_VERSION = 2          # bump to invalidate cached vectors when doc text changes
 DENSE_ENCODE_BATCH = 256
-RRF_DEPTH = int(os.environ.get("RRF_DEPTH", "60"))   # top-N pulled from each track
-RRF_K = int(os.environ.get("RRF_K", "60"))           # the "60" in 1 / (60 + rank)
+
+# "rerank" (default) | "rrf" (fixed-k legacy fusion) | "bm25" (dense off).
+# Kept switchable so the ablation in the report is one env var, and so a runtime
+# failure in either learned component can degrade to "bm25" mid-run.
+FUSION_MODE = os.environ.get("FUSION_MODE", "rerank").strip().lower()
+RERANK_DEPTH = int(os.environ.get("RERANK_DEPTH", "120"))  # BM25 candidates re-scored
+LEX_K = int(os.environ.get("LEX_K", "10"))                 # rank prior: 1 / (LEX_K + rank)
+# dense may move an item by at most this much; the lexical prior spans 1.0->0.09,
+# so semantics reorder locally without overturning a strong exact-phrase match.
+DENSE_WEIGHT = float(os.environ.get("DENSE_WEIGHT", "0.25"))
+
+# Legacy symmetric-RRF constants (FUSION_MODE=rrf only).  RRF_K is deliberately
+# NOT 60 here: with a 60-deep list, k=60 is the flattest possible setting.  k=10
+# restores a 6.4x span between rank 1 and rank 60.
+RRF_DEPTH = int(os.environ.get("RRF_DEPTH", "60"))
+RRF_K = int(os.environ.get("RRF_K", "10"))
 
 # --------------------------------------------------------------------------- #
-# Day 5 -- learned re-ranking layer (optional)
+# Day 5 -- optional cross-encoder re-ranker (OFF by default)
 # --------------------------------------------------------------------------- #
-# Re-scores the top RERANK_CANDIDATES of the RRF-fused list with a small,
-# locally-trained ranker (see starter/reranker/ + training/). Fully optional:
-# with RERANK_ENABLED=0, missing artifacts, or a missing dependency, the
-# agent falls straight back to the plain RRF order -- identical to Day 4
-# behaviour. Never trains or calls any external service at serving time.
+# A cross-encoder reads (query, document) jointly and is far stronger than
+# bi-encoder cosine on quoted-text matching -- exactly this task's shape.  It is
+# off by default because it costs ~30-60 forward passes per TURN on CPU, which
+# directly contradicts the Day 5 latency budget above.  Enable for a quality
+# ablation; leave off for the timed submission run.
+CROSS_ENCODER_ENABLED = os.environ.get("CROSS_ENCODER_ENABLED", "0") not in ("0", "false", "False")
+CROSS_ENCODER_MODEL = os.environ.get("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+CROSS_DEPTH = int(os.environ.get("CROSS_DEPTH", "30"))
+CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
+
+# --------------------------------------------------------------------------- #
+# Day 5 -- learned re-ranking layer (starter/reranker/ + training/)
+# --------------------------------------------------------------------------- #
+# Re-scores the head of the candidate list with a small locally-trained ranker.
+# Fully optional: with RERANK_ENABLED=0, a missing artifact, a missing
+# dependency, or no dense track, the candidate order passes through untouched.
+# Never trains or calls an external service at serving time.
 #
-# ENABLED BY DEFAULT (simplex). On the public set this is worth +0.0803
-# TechnicalScore over the plain RRF ordering -- 0.8410 vs. 0.7607 -- and it
-# improves every component metric: HitRate@10 0.960 vs 0.940, MRR 0.649 vs
-# 0.444, MTTC 2.68 vs 3.12.  Other trained models, same evaluator run:
-# mlp 0.8362, gbdt 0.8260, coord_ascent 0.8244, ranksvm 0.8181.  Select any
-# of them with RERANK_MODEL=<name>; the margins between the top three are
-# small relative to a 200-session sample, so treat that ordering as
-# provisional (see docs/reranker_eval_results.md).
+# HOW THIS COMPOSES WITH THE FIRST-STAGE FIX ABOVE
+# ------------------------------------------------
+# The layer was built and measured against the Day 4 first stage, where it is
+# worth +0.0803 (0.7607 -> 0.8410 on the public set).  But that control is the
+# degenerate symmetric-RRF ordering documented above, so most of that gain is
+# the model routing *around* the fusion defect rather than adding new signal.
+# The shipped simplex artifact says so directly: its 14 weights are one-hot on
+# `lexical_score`, with exactly 0.0 on rrf_score, bm25_rank_score,
+# dense_rank_score and every embedding/category-tree feature.  A constrained
+# optimiser over 45k training pairs independently concluded that this task is
+# lexical -- the same conclusion the first-stage rewrite reaches structurally.
 #
-# Simplex is also the cheapest to serve: the artifact is an 11-number JSON
-# weight vector scored with one numpy dot product, so the default path needs
-# no lightgbm (nor torch/scipy/sklearn) at inference time.
+# Both layers therefore address the SAME defect and are redundant rather than
+# additive.  They are kept independently switchable so the choice is empirical:
+#   FUSION_MODE=rrf    RERANK_ENABLED=1   -> the as-built Day 5 pipeline  0.8410
+#   FUSION_MODE=rerank RERANK_ENABLED=0   -> first-stage fix alone        0.8387
+#   FUSION_MODE=rerank RERANK_ENABLED=1   -> both composed (SHIPPED)      0.8498
 #
-# All of this holds only for the v2 training formulation. An earlier v1
-# (labels built from category siblings, no first-stage retrieval features)
-# scored BELOW the plain RRF order for every model type -- best 0.7006,
-# worst 0.3344, and simplex was that worst case. See
-# docs/reranker_eval_results.md for the root cause (label leakage into
-# sibling_max_sim, plus a training task that was nearly the opposite of the
-# real one) and what changed.
+# Measured, the redundancy hypothesis is WRONG: the layers compose, and the
+# learned re-ranker is worth +0.0111 on a fixed first stage (MRR 0.643 ->
+# 0.682).  `lexical_score` is not a cruder BM25 -- BM25 is IDF- and
+# field-weighted, while `lexical_score` is raw query-token *coverage*, and the
+# two signals add.  Measuring the layer against a broken control understated
+# what it contributes.
+# See docs/first_stage_ablation.md and docs/reranker_eval_results.md.
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
 RERANK_MODEL = os.environ.get("RERANK_MODEL", "simplex")
 RERANK_ARTIFACTS_DIR = Path(
@@ -204,28 +300,24 @@ _NO_INFO_MARKERS = (
     "not quite right yet",
 )
 
+# Token-optimised router prompt (Day 5).  Same semantics as the Day 2 prompt,
+# ~60% fewer prompt tokens; single-letter JSON keys cut completion tokens again.
+# `responseSchema` pins the shape, so terseness costs no reliability -- and
+# ``_normalize_route`` still accepts the old long keys if the model ignores it.
+#   i = intent | sl = slots | kw = keywords | ov = override | pf = profile terms
 _ROUTER_SYSTEM = (
-    "You are the intent router for a Clothing/Shoes/Jewelry shopping search agent.\n"
-    "Given the current conversation state and the newest customer message, reply with "
-    "ONE JSON object and nothing else:\n"
-    '{\n'
-    '  "intent": "buying" | "browsing",\n'
-    '  "extracted_slots": {"category": str|null, "gender": str|null, "color": str|null,\n'
-    '                      "material": str|null, "style": str|null, "brand": str|null,\n'
-    '                      "use_case": str|null, "budget": str|null, "keywords": [str]},\n'
-    '  "intent_override": true | false\n'
-    '}\n'
-    "Rules:\n"
-    "- intent=\"buying\" when the customer gives firm, specific requirements; "
-    "\"browsing\" when vague, exploring, or only a broad category is known.\n"
-    "- Fill a slot only with something the customer actually says in THIS message "
-    "(new or explicitly restated). Use null otherwise. Lowercase all values.\n"
-    "- gender: men / women / kids / girls / boys / baby / unisex, only if stated.\n"
-    "- keywords: other salient constraint words not covered by a slot (max 6).\n"
-    "- intent_override=true ONLY when the customer abandons the previously stated "
-    "product CATEGORY for a different one (\"actually I want a dress instead\"). "
-    "A changed colour/material/size/fit/preference is NOT an override.\n"
-    "Output JSON only, no prose."
+    "Intent router for a clothing/shoes/jewelry search agent. Output ONLY compact JSON, no prose.\n"
+    '{"i":"buying|browsing","sl":{"category":s,"gender":s,"color":s,"material":s,'
+    '"style":s,"brand":s,"use_case":s,"budget":s},"kw":[s],"ov":b,"pf":[s]}\n'
+    "i: buying=firm specific requirements; browsing=vague/exploring/broad category only.\n"
+    "sl: only what THIS message states (new or restated), else null. lowercase, <=3 words.\n"
+    "gender: men|women|kids|girls|boys|baby|unisex, only if stated.\n"
+    "kw: <=6 other constraint words not covered by a slot.\n"
+    "ov: true ONLY if the customer abandons the stated product CATEGORY for a different "
+    "one. A changed color/material/size/fit is NOT ov.\n"
+    "pf: <=2 concrete product attributes implied by PROFILE that fit this request "
+    "(e.g. 'dark colors'). [] if PROFILE is generic (fit/comfort/style/material/durability) "
+    "or conflicts with the request. Never invent."
 )
 
 _CLARIFY_SYSTEM = (
@@ -239,19 +331,50 @@ _CLARIFY_SYSTEM = (
 _ROUTER_SCHEMA = {
     "type": "object",
     "properties": {
-        "intent": {"type": "string", "enum": ["buying", "browsing"]},
-        "extracted_slots": {
+        "i": {"type": "string", "enum": ["buying", "browsing"]},
+        "sl": {
             "type": "object",
-            "properties": {
-                **{k: {"type": "string", "nullable": True} for k in SLOT_KEYS},
-                "keywords": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": [*SLOT_KEYS, "keywords"],
+            "properties": {k: {"type": "string", "nullable": True} for k in SLOT_KEYS},
+            "required": list(SLOT_KEYS),
         },
-        "intent_override": {"type": "boolean"},
+        "kw": {"type": "array", "items": {"type": "string"}},
+        "ov": {"type": "boolean"},
+        "pf": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["intent", "extracted_slots", "intent_override"],
+    "required": ["i", "sl", "kw", "ov", "pf"],
 }
+
+
+def _normalize_route(parsed: dict) -> dict:
+    """Map the compact router reply onto the internal long-key shape.
+
+    Accepts either the Day 5 compact keys (``i``/``sl``/``kw``/``ov``/``pf``) or
+    the Day 2 long keys, so a model that ignores ``responseSchema`` -- or a
+    cached entry written by an older build -- still parses.
+    """
+    if not isinstance(parsed, dict):
+        return {}
+    slots = parsed.get("sl")
+    if not isinstance(slots, dict):
+        slots = parsed.get("extracted_slots")
+        slots = slots if isinstance(slots, dict) else {}
+    keywords = parsed.get("kw")
+    if not isinstance(keywords, list):
+        keywords = slots.get("keywords")          # Day 2 nested keywords
+        keywords = keywords if isinstance(keywords, list) else []
+    override = parsed.get("ov")
+    if not isinstance(override, bool):
+        override = parsed.get("intent_override") is True
+    profile_terms = parsed.get("pf")
+    if not isinstance(profile_terms, list):
+        profile_terms = []
+    return {
+        "intent": parsed.get("i") or parsed.get("intent"),
+        "slots": {k: slots.get(k) for k in SLOT_KEYS},
+        "keywords": keywords,
+        "override": override,
+        "profile_terms": profile_terms,
+    }
 
 
 def _load_dotenv(path: str | Path = ".env") -> None:
@@ -410,6 +533,50 @@ def _split_first_message(low: str) -> tuple[str, str]:
     return anchor.strip(" .,"), ""
 
 
+def _distill_profile(user_profile: object) -> dict:
+    """Distill the aggregate `user_profile` into prompt text + boost terms.
+
+    Returns ``{"tags", "summary", "terms", "line"}``:
+      * ``tags``    -- raw preference tags, kept for disclosure / explanations.
+      * ``summary`` -- the profile summary string, trimmed.
+      * ``terms``   -- the *discriminating* subset, used only for the soft
+        re-rank boost.  Anything in ``GENERIC`` or ``STOPWORDS`` is dropped:
+        fit / comfort / material / style / durability describe ~every apparel
+        product (and appear in 24-82% of sessions), so boosting on them is a
+        no-op at best and a systematic bias at worst.
+      * ``line``    -- one compact line for the LLM prompt (bounded length, so
+        a verbose profile cannot inflate prompt tokens).
+
+    Never raises: a malformed or missing profile distills to an empty result and
+    the agent behaves exactly as if personalization were disabled.
+    """
+    empty = {"tags": [], "summary": "", "terms": [], "line": ""}
+    if not PROFILE_ENABLED or not isinstance(user_profile, dict):
+        return empty
+    try:
+        raw_tags = user_profile.get("preference_tags")
+        tags = [str(t).strip().lower() for t in raw_tags if str(t).strip()] if isinstance(raw_tags, list) else []
+        summary = str(user_profile.get("summary") or "").strip()
+
+        terms: list[str] = []
+        for tag in tags:
+            for token in _tokens(tag):
+                if token not in GENERIC and token not in COLORS and len(token) > 2:
+                    terms.append(token)
+        terms = _dedupe(terms)[:PROFILE_MAX_TERMS]
+
+        # Only the discriminating part is worth prompt tokens; a summary that is
+        # just the generic tags restated adds nothing the router can act on.
+        line = ", ".join(terms)
+        if summary and terms:
+            line = f"{line} ({summary[:120]})"
+        elif summary:
+            line = summary[:120]
+        return {"tags": tags, "summary": summary, "terms": terms, "line": line[:180]}
+    except Exception:
+        return empty
+
+
 def _parse_router_json(text: str) -> dict:
     """Parse the router's reply, tolerating stray prose / code fences around the JSON."""
     text = text.strip()
@@ -430,18 +597,29 @@ class Agent:
       * Day 2 -- a Google Gemini intent router (REST, stdlib only): Buying vs
         Browsing, constraint-slot extraction, category-override detection.
       * Day 3 -- proactive clarification when the query is far too broad.
-      * Day 4 -- a dense retrieval track (sentence-transformers, cached in-memory
-        vectors).  Every turn runs BM25 and dense; the two ranked lists are
-        combined by unconditional Reciprocal Rank Fusion.
-      * Day 5 -- an optional learned re-ranking layer (see starter/reranker/)
-        that re-scores the top of the RRF-fused list with a small locally
-        trained ranker.  Falls back to the plain Day 4 order if disabled,
-        untrained, or missing a dependency.
+      * Day 4 -- a dense track (sentence-transformers, cached in-memory vectors).
+      * Day 5 -- personalized context distillation from the aggregate profile,
+        semantic RE-RANKING in place of symmetric fusion, a token / latency
+        budget, and an optional learned re-ranking layer (starter/reranker/).
 
-    Every LLM / dense / re-ranking component is optional.  With no Gemini key
-    and no numpy/sentence-transformers (the offline final-scoring case the
-    rules allow) the agent is pure BM25 and behaves exactly as Day 1-3,
-    ``usage`` all zeros.
+    Design rule that ties Day 5 together: **only BM25 may decide which documents
+    are candidates.**  The LLM, the dense model, the optional cross-encoder and
+    the user profile all reorder that set; none of them can add or remove a
+    member.  Recall is therefore a pure function of the lexical gate, and every
+    learned component is free to fail without costing a hit.
+
+    Failure behaviour, by component:
+      * no Gemini key / timeout / bad JSON  -> deterministic parser only
+      * 3 consecutive LLM errors            -> breaker trips for the whole run
+      * per-session LLM budget exceeded     -> deterministic parser only
+      * no numpy / sentence-transformers    -> pure BM25 ranking
+      * encode or cross-encode failure      -> that term contributes 0.0
+      * malformed FTS expression            -> that tier contributes no rows
+      * anything else                       -> ``_last_resort`` BM25 response
+
+    With no key and no vector deps (the offline final-scoring case the rules
+    allow) the agent is pure BM25 and behaves exactly as Day 1-3, ``usage`` all
+    zeros.
     """
 
     def __init__(
@@ -462,16 +640,19 @@ class Agent:
         self._llm_fail_streak = 0          # consecutive failures; 3 -> trip the breaker
         self._route_cache: dict[tuple, dict] = {}
         self.llm_usage_total = {"prompt_tokens": 0, "completion_tokens": 0}  # for disclosure
-        # dense track (Day 4)
+        # dense track (Day 4) / semantic re-ranker (Day 5)
         self._embedder = None
         self._doc_vecs = None              # (N, dim) float32, L2-normalised
         self._dense_ids: list[str] = []
-        self._catalog: dict[str, dict] = {}   # asin -> raw product dict, filled by _build_index
+        self._dense_index: dict[str, int] = {}   # parent_asin -> row in _doc_vecs
+        self._cross_encoder = None
+        self._fusion_mode = FUSION_MODE if FUSION_MODE in ("rerank", "rrf", "bm25") else "rerank"
+        self._catalog: dict[str, dict] = {}      # asin -> raw product, filled by _build_index
         self._build_index()
         self._init_dense(use_dense)
-        # re-ranking layer (Day 5)
+        self._init_cross_encoder()
+        # learned re-ranking layer (Day 5)
         self._cat_index = None
-        self._dense_id_row: dict[str, int] = {}
         self._doc_tokens: dict[str, frozenset[str]] = {}
         self._reranker = None
         self._init_reranker()
@@ -547,11 +728,13 @@ class Agent:
         if cache.is_file():
             try:
                 blob = _np.load(cache, allow_pickle=True)
-                self._dense_ids = list(blob["ids"])
+                self._dense_ids = [str(i) for i in blob["ids"]]
                 self._doc_vecs = blob["vecs"].astype("float32")
+                self._dense_index = {a: i for i, a in enumerate(self._dense_ids)}
                 return
             except Exception:
-                pass  # corrupt cache -> rebuild
+                self._dense_ids, self._doc_vecs, self._dense_index = [], None, {}
+                # corrupt / truncated cache -> fall through and rebuild
 
         ids: list[str] = []
         texts: list[str] = []
@@ -575,6 +758,7 @@ class Agent:
             self._embedder = None
             return
         self._dense_ids, self._doc_vecs = ids, vecs
+        self._dense_index = {a: i for i, a in enumerate(ids)}
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             _np.savez(cache, ids=_np.array(ids, dtype=object), vecs=vecs)
@@ -583,18 +767,22 @@ class Agent:
 
     # -- Day 5: learned re-ranking layer ------------------------------------ #
     def _init_reranker(self) -> None:
-        """Best-effort setup of the category index + trained re-ranker.  Any
-        missing dependency, missing artifact, or unexpected error leaves
-        self._reranker as None -- respond() then behaves exactly like Day 4."""
+        """Best-effort setup of the category index + trained re-ranker.
+
+        Any missing dependency, missing artifact, or unexpected error leaves
+        ``self._reranker`` as None and the candidate order passes through
+        untouched.  Note the dense gate: the feature extractor needs the
+        document vectors, so with no dense track there is no learned re-rank
+        (even for simplex, whose one live feature is lexical).
+        """
         if not RERANK_ENABLED or load_reranker is None or not self._dense_on():
             return
         try:
-            self._dense_id_row = {asin: i for i, asin in enumerate(self._dense_ids)}
             self._cat_index = build_category_index(self._catalog, self._doc_vecs, self._dense_ids)
             self._doc_tokens = {
                 asin: frozenset(_tokens(_dense_doc_text(product)))
                 for asin, product in self._catalog.items()
-                if asin in self._dense_id_row
+                if asin in self._dense_index
             }
             self._reranker = load_reranker(RERANK_ARTIFACTS_DIR, model=RERANK_MODEL)
         except Exception:
@@ -606,6 +794,7 @@ class Agent:
         self, candidates: list[str], query_text: str,
         bm25_ranked: list[str] | None = None, dense_ranked: list[str] | None = None,
     ) -> list[str]:
+        """Learned re-scoring of ``candidates``; returns them unchanged on any failure."""
         if not candidates or self._reranker is None or self._cat_index is None:
             return candidates
         try:
@@ -616,42 +805,163 @@ class Agent:
             qv = (raw / q_norm).astype("float32")
             X = compute_feature_matrix(
                 qv, q_norm, _tokens(query_text), candidates,
-                self._cat_index, self._doc_vecs, self._dense_id_row, self._doc_tokens,
+                self._cat_index, self._doc_vecs, self._dense_index, self._doc_tokens,
                 bm25_ranked=bm25_ranked, dense_ranked=dense_ranked, rrf_k=RRF_K,
             )
             return self._reranker.rank(X, candidates)
         except Exception:
             return candidates
 
-    def _dense_rank(self, query_text: str, top_n: int) -> list[str]:
-        if not self._dense_on() or not query_text.strip():
-            return []
+    def _init_cross_encoder(self) -> None:
+        """Optional Day 5 cross-encoder (off by default -- see CROSS_ENCODER_ENABLED)."""
+        if not CROSS_ENCODER_ENABLED:
+            return
         try:
-            qv = self._embedder.encode(
+            from sentence_transformers import CrossEncoder  # local import: optional dep
+
+            self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+        except Exception:
+            self._cross_encoder = None   # missing package / no network -> silently skip
+
+    def _encode_query(self, query_text: str):
+        """Encode one query string, or return ``None`` on any failure."""
+        if not self._dense_on() or not query_text.strip():
+            return None
+        try:
+            return self._embedder.encode(
                 [query_text], convert_to_numpy=True, normalize_embeddings=True,
             )[0].astype("float32")
         except Exception:
+            # A runtime encode failure (OOM, thread crash, model unloaded) must not
+            # kill the turn: returning None degrades this turn to pure BM25.
+            return None
+
+    def _dense_rank(self, query_text: str, top_n: int) -> list[str]:
+        """Full-catalog dense ranking. Only used by the legacy FUSION_MODE=rrf path."""
+        qv = self._encode_query(query_text)
+        if qv is None:
             return []
-        sims = self._doc_vecs @ qv                      # cosine (both L2-normalised)
-        top_n = min(top_n, sims.shape[0])
-        part = _np.argpartition(-sims, top_n - 1)[:top_n]
-        order = part[_np.argsort(-sims[part])]
-        return [self._dense_ids[i] for i in order]
+        try:
+            sims = self._doc_vecs @ qv                  # cosine (both L2-normalised)
+            top_n = max(1, min(top_n, sims.shape[0]))
+            part = _np.argpartition(-sims, top_n - 1)[:top_n]
+            order = part[_np.argsort(-sims[part])]
+            return [self._dense_ids[i] for i in order]
+        except Exception:
+            return []
+
+    def _dense_scores(self, candidates: list[str], query_text: str) -> dict[str, float]:
+        """Cosine for a BM25 candidate set only -- the Day 5 re-ranking path.
+
+        Scoring the candidates instead of the catalog is what makes dense unable
+        to damage recall: a document the lexical gate rejected is never scored,
+        so it can never enter the top-10.  It is also ~400x less matrix work than
+        the full 50k dot product.
+        """
+        qv = self._encode_query(query_text)
+        if qv is None or not candidates:
+            return {}
+        try:
+            pairs = [(a, self._dense_index[a]) for a in candidates if a in self._dense_index]
+            if not pairs:
+                return {}
+            rows = _np.fromiter((i for _, i in pairs), dtype=_np.int64, count=len(pairs))
+            sims = self._doc_vecs[rows] @ qv
+            return {asin: float(score) for (asin, _), score in zip(pairs, sims)}
+        except Exception:
+            return {}
+
+    def _cross_scores(self, candidates: list[str], query_text: str) -> dict[str, float]:
+        """Optional cross-encoder scores over the shallow head of the candidates."""
+        if self._cross_encoder is None or not candidates or not query_text.strip():
+            return {}
+        head = candidates[:CROSS_DEPTH]
+        try:
+            rows = self.connection.execute(
+                "SELECT parent_asin, title, category, features FROM products "
+                f"WHERE parent_asin IN ({','.join('?' * len(head))})",
+                head,
+            ).fetchall()
+            texts = {r[0]: " ".join(str(p) for p in r[1:] if p)[:512] for r in rows}
+            ordered = [a for a in head if a in texts]
+            if not ordered:
+                return {}
+            scores = self._cross_encoder.predict(
+                [(query_text, texts[a]) for a in ordered], show_progress_bar=False
+            )
+            return {a: float(s) for a, s in zip(ordered, scores)}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _minmax(scores: dict[str, float]) -> dict[str, float]:
+        """Min-max normalise to [0, 1]; a flat/degenerate set contributes nothing."""
+        if not scores:
+            return {}
+        values = list(scores.values())
+        low, high = min(values), max(values)
+        if high - low < 1e-9:
+            return {key: 0.0 for key in scores}
+        span = high - low
+        return {key: (value - low) / span for key, value in scores.items()}
 
     @staticmethod
     def _dense_query_text(state: dict, user_message: str) -> str:
-        """The 'vibe' string to embed: recent shopper wording + structured slots."""
-        parts: list[str] = []
-        for message in state["history"][-3:]:
+        """The 'vibe' string to embed: structured slots first, recent wording after.
+
+        Day 5 ordering fix.  This used to build ``history[-3:]`` first and slots
+        last, then truncate at 400 chars -- but by turn 4 the raw messages alone
+        exceed 400 chars, so the truncation was deleting the structured slots and
+        keeping the boilerplate.  Priority is now inverted: highest-signal terms
+        first, oldest free text truncated away.
+        """
+        parts: list[str] = [v for v in state["slots"].values() if v]
+        parts.extend(state["keywords"])
+        # newest message first -- the constraint just disclosed is the sharpest
+        for message in reversed(state["history"][-3:]):
             cleaned = _BOILERPLATE_RE.sub(" ", message.lower())
             cleaned = re.sub(r"\s+", " ", cleaned).strip(" .;:")
             if cleaned:
                 parts.append(cleaned)
-        parts.extend(v for v in state["slots"].values() if v)
-        parts.extend(state["keywords"])
         seen: set[str] = set()
         uniq = [p for p in parts if not (p in seen or seen.add(p))]
         return " ; ".join(uniq)[:400] or user_message.strip()
+
+    # -- Day 5: profile boost lane ----------------------------------------- #
+    def _profile_boost_set(self, state: dict) -> set[str]:
+        """Asins matching the distilled profile terms, computed once per session.
+
+        A single OR query over the existing FTS index -- no extra structure, and
+        the result is cached on the state because the term set rarely changes.
+        """
+        if not PROFILE_ENABLED or PROFILE_WEIGHT <= 0.0:
+            return set()
+        if state["profile_hits"] is not None:
+            return state["profile_hits"]
+        terms = state["profile_terms"]
+        if not terms:
+            state["profile_hits"] = set()
+            return state["profile_hits"]
+        expression = "(" + " OR ".join(f'"{t}"' for t in terms) + ")"
+        rows = self._safe_execute(
+            f"SELECT parent_asin FROM products WHERE products MATCH ? "
+            f"ORDER BY {self._order_by} LIMIT ?",
+            (expression, 4000),
+        )
+        state["profile_hits"] = {r[0] for r in rows}
+        return state["profile_hits"]
+
+    def _safe_execute(self, sql: str, params: tuple) -> list[tuple]:
+        """Run one query; any sqlite failure yields an empty result, never raises.
+
+        FTS5 MATCH expressions are built from customer text, so a pathological
+        message can produce a syntactically invalid query.  That must cost this
+        tier its rows -- not the turn.
+        """
+        try:
+            return self.connection.execute(sql, params).fetchall()
+        except (sqlite3.OperationalError, sqlite3.DatabaseError, ValueError):
+            return []
 
     # -- session lifecycle ---------------------------------------------------- #
     @staticmethod
@@ -669,14 +979,35 @@ class Agent:
             "exhausted": False,
             "stale": 0,
             "last_signature": None,
+            # ---- personalization (Day 5) ------------------------------------
+            "profile": {"tags": [], "summary": "", "terms": [], "line": ""},
+            "profile_terms": [],       # distilled + LLM-proposed, boost lane only
+            "profile_hits": None,      # cached asin set matching those terms
+            # ---- budgets / recovery (Day 5) ---------------------------------
+            "llm_calls": 0,
+            "last_ranked": [],         # last non-empty result list, for recovery
         }
 
     def reset(self, session_id: str, user_profile: dict) -> None:
-        # Fresh conversational memory for the session (intent, constraint slots,
-        # keyword bag, message history -- see ``_new_state``).  The aggregate
-        # profile is intentionally not folded into sparse retrieval: its
-        # preference tags ("fit", "comfort", ...) are high-frequency noise here.
-        self._state[session_id] = self._new_state()
+        """Start a session and distill its aggregate profile.
+
+        Day 5 -- personalized context distillation.  ``user_profile`` carries
+        ``preference_tags`` and ``summary``; both are extracted here, once, and
+        cached on the session state.  From this point they reach the agent by
+        exactly two routes:
+
+          1. as a compact PROFILE line in the router prompt, so the LLM can
+             surface an implied *concrete* attribute it would otherwise miss;
+          2. as ``profile_terms`` feeding a small additive re-rank boost.
+
+        Neither route can add or remove a retrieval candidate -- see the
+        PROFILE_ENABLED notes at the top of the file for why that separation is
+        deliberate rather than conservative.
+        """
+        state = self._new_state()
+        state["profile"] = _distill_profile(user_profile)
+        state["profile_terms"] = list(state["profile"]["terms"])
+        self._state[session_id] = state
 
     # -- per-turn ingestion of the simulated customer's message -------------- #
     def _ingest(self, state: dict, message: str, turn: int) -> None:
@@ -729,20 +1060,33 @@ class Agent:
         low = message.strip().lower()
         if state["seen_first"] and any(marker in low for marker in _NO_INFO_MARKERS):
             return 0, 0  # boilerplate turn -- nothing to extract, save the call
+        if state["exhausted"]:
+            return 0, 0  # customer has nothing left to disclose; routing is frozen
 
         cache_key = (
             message.strip(),
             state["slots"].get("category"),
             tuple(sorted(state["keywords"])),
+            state["profile"]["line"],   # profile is part of the prompt -> part of the key
         )
         if cache_key in self._route_cache:
             self._apply_route(state, self._route_cache[cache_key])
             return 0, 0
 
+        # Hard per-session budget: bounds worst-case cost and latency even if the
+        # simulator keeps producing novel messages (feasibility measure).
+        if state["llm_calls"] >= LLM_MAX_CALLS_PER_SESSION:
+            return 0, 0
+
         try:
+            state["llm_calls"] += 1
             parsed, prompt_tokens, completion_tokens = self._call_router(state, message)
         except Exception:
-            self._note_llm_failure()  # trips the breaker after a few consecutive fails
+            # Any failure at all -- timeout, HTTP error, bad JSON, schema drift --
+            # is non-fatal: the deterministic Day 1 parser has already ingested
+            # this turn, so retrieval proceeds on BM25 exactly as if the LLM were
+            # disabled.  Three consecutive failures trip the breaker for the run.
+            self._note_llm_failure()
             return 0, 0
 
         self._llm_fail_streak = 0
@@ -790,35 +1134,44 @@ class Agent:
         )
 
     def _call_router(self, state: dict, message: str) -> tuple[dict, int, int]:
-        context = {
-            "current_intent": state["intent"],
-            "known_slots": {k: v for k, v in state["slots"].items() if v},
-            "known_keywords": state["keywords"][-12:],
-        }
-        user_block = (
-            "CONVERSATION STATE:\n" + json.dumps(context, ensure_ascii=False)
-            + "\n\nNEW CUSTOMER MESSAGE:\n" + message.strip()
-            + "\n\nReturn the routing JSON."
-        )
+        # Compact context block: short keys, only non-empty fields, keyword tail
+        # capped.  Every byte here is billed on all ~10 turns of every session.
+        context = {"in": state["intent"]}
+        known = {k: v for k, v in state["slots"].items() if v}
+        if known:
+            context["sl"] = known
+        if state["keywords"]:
+            context["kw"] = state["keywords"][-10:]
+
+        parts = ["STATE:" + json.dumps(context, ensure_ascii=False, separators=(",", ":"))]
+        # Day 5 -- personalized context distillation reaches the model here.
+        if state["profile"]["line"]:
+            parts.append("PROFILE:" + state["profile"]["line"])
+        parts.append("MSG:" + message.strip())
+        user_block = "\n".join(parts)
+
         text, prompt_tokens, completion_tokens = self._gemini_generate(
             _ROUTER_SYSTEM, user_block, schema=_ROUTER_SCHEMA
         )
         return _parse_router_json(text), prompt_tokens, completion_tokens
 
     def _apply_route(self, state: dict, parsed: dict) -> None:
-        intent = str(parsed.get("intent", "")).strip().lower()
+        route = _normalize_route(parsed)
+        if not route:
+            return
+
+        intent = str(route.get("intent") or "").strip().lower()
         if intent in ("buying", "browsing"):
             state["intent"] = intent
 
-        slots = parsed.get("extracted_slots")
-        slots = slots if isinstance(slots, dict) else {}
+        slots = route["slots"]
         new_category = slots.get("category")
         new_category = new_category.strip().lower() if isinstance(new_category, str) and new_category.strip() else None
 
         # Requirement 4: a genuine category change wipes the conflicting slots.
         # Guard on "the LLM told us what to switch to" so a mis-fire on a mere
         # preference swap can't erase a good category gate.
-        if parsed.get("intent_override") is True and new_category:
+        if route["override"] and new_category:
             for key in ("category", "style", "use_case"):
                 state["slots"][key] = None
             state["keywords"] = []
@@ -826,18 +1179,33 @@ class Agent:
             state["constraint_terms"] = []    # and its now-stale constraint tokens
             # colour / material / brand / budget slots survive (not category-bound);
             # the LLM nulls them itself if it judged them stale.
+            state["profile_hits"] = None      # boost set was scoped to the old query
 
         for key in SLOT_KEYS:
             value = slots.get(key)
             if isinstance(value, str) and value.strip():
                 state["slots"][key] = value.strip().lower()
 
-        extra = slots.get("keywords")
-        if isinstance(extra, list):
-            for word in extra:
-                if isinstance(word, str) and word.strip():
-                    state["keywords"].append(word.strip().lower())
+        for word in route["keywords"]:
+            if isinstance(word, str) and word.strip():
+                state["keywords"].append(word.strip().lower())
         state["keywords"] = _dedupe(state["keywords"])[-20:]
+
+        # Day 5 -- profile-implied attributes ("prefers dark colors" -> "dark").
+        # These land in the boost lane ONLY.  They are never appended to
+        # ``keywords``, which feeds the FTS gate: a hallucinated or merely
+        # stale profile term must not be able to filter out the target.
+        if PROFILE_ENABLED:
+            for term in route["profile_terms"]:
+                if not isinstance(term, str) or not term.strip():
+                    continue
+                for token in _tokens(term):
+                    if token not in GENERIC and len(token) > 2:
+                        state["profile_terms"].append(token)
+            trimmed = _dedupe(state["profile_terms"])[:PROFILE_MAX_TERMS]
+            if trimmed != state["profile_terms"]:
+                state["profile_hits"] = None   # term set changed -> invalidate cache
+            state["profile_terms"] = trimmed
 
     # -- query construction ------------------------------------------------- #
     def _slot_terms(self, state: dict) -> tuple[list[str], list[str]]:
@@ -912,26 +1280,23 @@ class Agent:
         for position, expression in enumerate(expressions):
             if not expression:
                 continue
-            try:
-                rows = self.connection.execute(
-                    f"SELECT parent_asin FROM products WHERE products MATCH ? "
-                    f"ORDER BY {self._order_by} LIMIT ?",
-                    (expression, depth),
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue
+            rows = self._safe_execute(
+                f"SELECT parent_asin FROM products WHERE products MATCH ? "
+                f"ORDER BY {self._order_by} LIMIT ?",
+                (expression, depth),
+            )
             weight = 1.0 / (1 + position)
             for rank, (asin,) in enumerate(rows):
                 fused[asin] = fused.get(asin, 0.0) + weight / (10 + rank)
         ordered = sorted(fused, key=lambda a: fused[a], reverse=True)
         return ordered[: (limit or top_k)]
 
-    def _bm25_ranked(self, state: dict) -> list[str]:
-        """The FTS5 BM25 track: tiered query -> internal RRF -> top RRF_DEPTH ids."""
+    def _bm25_ranked(self, state: dict, depth: int) -> list[str]:
+        """The FTS5 BM25 track: tiered query -> internal weighted RRF -> top ids."""
         expressions = self._build_queries(state, rotate=state["stale"])
         if not expressions:
             return []
-        return self._search(expressions, RRF_DEPTH, limit=RRF_DEPTH)
+        return self._search(expressions, depth, limit=depth)
 
     def _dense_ranked(self, state: dict, user_message: str) -> list[str]:
         """The Sentence-Transformer track: cosine top RRF_DEPTH ids (or [] if off)."""
@@ -941,7 +1306,12 @@ class Agent:
 
     @staticmethod
     def _rrf_fuse(*ranked_lists: list[str], k: int = RRF_K, top_k: int | None = None) -> list[str]:
-        """Textbook Reciprocal Rank Fusion: score(d) = sum_l 1 / (k + rank_l(d))."""
+        """Textbook Reciprocal Rank Fusion: score(d) = sum_l 1 / (k + rank_l(d)).
+
+        Legacy path (FUSION_MODE=rrf).  ``k`` now defaults to 10, not 60: with
+        60-deep lists, k=60 made rank 1 and rank 60 differ by only 1.97x, so a
+        doc ranked last in both lists outscored the top hit of either.
+        """
         scores: dict[str, float] = {}
         for ranked in ranked_lists:
             for rank, doc_id in enumerate(ranked, start=1):
@@ -949,17 +1319,95 @@ class Agent:
         order = sorted(scores, key=lambda d: scores[d], reverse=True)
         return order[:top_k] if top_k else order
 
+    def _rank(self, state: dict, user_message: str, top_k: int) -> list[str]:
+        """Produce the final ranked ids for this turn.
+
+        ``rerank`` (default):  BM25 fixes the candidate set, then semantics and
+        the profile reorder within it --
+
+            score = lex_prior + DENSE_WEIGHT * cosine + CROSS_WEIGHT * cross
+                              + PROFILE_WEIGHT * profile_match
+
+        ``lex_prior`` is 1/(LEX_K + rank) renormalised so rank 1 == 1.0, giving a
+        1.0 -> 0.09 span across 120 candidates.  Every learned term is min-max
+        normalised to [0, 1] and weighted well below that span, so semantics can
+        reorder neighbours but cannot overturn a decisive lexical match -- the
+        right prior when the shopper is quoting the target document verbatim.
+
+        The learned re-ranking layer, when enabled, runs last on the head of
+        whatever ordering this produced -- so the two Day 5 tracks compose
+        rather than compete.
+        """
+        query_text = self._dense_query_text(state, user_message)
+
+        if self._fusion_mode == "rrf":      # legacy symmetric fusion, fixed k
+            bm25_ranked = self._bm25_ranked(state, RRF_DEPTH)
+            dense_ranked = self._dense_ranked(state, user_message)
+            fused = self._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=None)
+            return self._apply_learned_rerank(
+                fused, query_text, bm25_ranked, dense_ranked, top_k
+            )
+
+        candidates = self._bm25_ranked(state, RERANK_DEPTH)
+        if not candidates:
+            return []
+        if self._fusion_mode == "bm25":
+            return self._apply_learned_rerank(candidates, query_text, candidates, [], top_k)
+
+        # 1. lexical prior -- normalised so the BM25 winner starts at exactly 1.0
+        head = 1.0 / (LEX_K + 1)
+        scores = {a: (1.0 / (LEX_K + r)) / head for r, a in enumerate(candidates, start=1)}
+
+        # 2. semantic re-rank, scored over the candidates only
+        dense_ranked: list[str] = []
+        if DENSE_WEIGHT > 0.0 and self._dense_on():
+            dense_scores = self._dense_scores(candidates, query_text)
+            # a dense ordering restricted to the candidates -- feeds both the
+            # blend below and the learned layer's dense_rank_score feature
+            dense_ranked = sorted(dense_scores, key=lambda a: dense_scores[a], reverse=True)
+            for asin, sem in self._minmax(dense_scores).items():
+                scores[asin] += DENSE_WEIGHT * sem
+            if self._cross_encoder is not None:
+                for asin, cross in self._minmax(self._cross_scores(candidates, query_text)).items():
+                    scores[asin] += CROSS_WEIGHT * cross
+
+        # 3. personalization -- a small additive tiebreak, never a filter
+        boost = self._profile_boost_set(state)
+        if boost:
+            for asin in scores:
+                if asin in boost:
+                    scores[asin] += PROFILE_WEIGHT
+
+        # ties resolve to BM25 order (candidates is already sorted, sort is stable)
+        ordered = sorted(candidates, key=lambda a: scores.get(a, 0.0), reverse=True)
+        return self._apply_learned_rerank(ordered, query_text, candidates, dense_ranked, top_k)
+
+    def _apply_learned_rerank(
+        self, ordered: list[str], query_text: str,
+        bm25_ranked: list[str], dense_ranked: list[str], top_k: int,
+    ) -> list[str]:
+        """Run the trained re-ranker over the head of ``ordered``, then slice.
+
+        A no-op when the layer is disabled or unavailable, so every fusion mode
+        keeps its own ordering intact.  Only the head is re-scored; the tail is
+        appended unchanged, which bounds both the cost and the blast radius.
+        """
+        if self._reranker is None or not ordered:
+            return ordered[:top_k]
+        head = self._rerank(
+            ordered[:RERANK_CANDIDATES], query_text,
+            bm25_ranked=bm25_ranked, dense_ranked=dense_ranked,
+        )
+        return (head + ordered[len(head):])[:top_k]
+
     # -- Day 3: over-generality -> proactive clarification ------------------- #
     def _count_matches(self, expression: str) -> int:
         if not expression:
             return 0
-        try:
-            row = self.connection.execute(
-                "SELECT count(*) FROM products WHERE products MATCH ?", (expression,)
-            ).fetchone()
-        except sqlite3.OperationalError:
-            return 0
-        return int(row[0]) if row else 0
+        rows = self._safe_execute(
+            "SELECT count(*) FROM products WHERE products MATCH ?", (expression,)
+        )
+        return int(rows[0][0]) if rows and rows[0] else 0
 
     def _clarify_slot(self, state: dict, turn: int) -> tuple[str, int] | None:
         """Return ``(attribute_to_ask, match_count)`` when the query is too broad
@@ -1024,8 +1472,57 @@ class Agent:
         turn: int,
         top_k: int,
     ) -> dict:
+        """Answer one turn. Never raises -- see ``_last_resort``.
+
+        The evaluator catches exceptions but scores the turn with zero
+        recommendations, so an uncaught error is a wasted turn (and, if it
+        recurs, a zeroed session).  Degradation is therefore staged:
+
+            full path -> BM25-only -> unranked category match -> empty-but-valid
+
+        Each learned component already fails soft on its own (the LLM breaker,
+        ``_encode_query``, ``_safe_execute``); this outer guard exists for the
+        residual case where state itself is corrupt.
+        """
+        try:
+            return self._respond_inner(session_id, user_message, turn, top_k)
+        except Exception:
+            return self._last_resort(session_id, top_k)
+
+    def _last_resort(self, session_id: str, top_k: int) -> dict:
+        """Emergency path: pure BM25 off whatever state survived, else empty."""
+        recommendations: list[dict] = []
+        state = self._state.get(session_id)
+        try:
+            if state is not None:
+                recommendations = [
+                    {"parent_asin": a} for a in self._bm25_ranked(state, top_k)[:top_k]
+                ]
+        except Exception:
+            recommendations = []
+        if not recommendations and isinstance(state, dict):
+            try:  # last good list from an earlier turn of this session
+                recommendations = [{"parent_asin": a} for a in state.get("last_ranked", [])[:top_k]]
+            except Exception:
+                recommendations = []
+        return {
+            "message": "Here are the closest matches I found.",
+            "ask_attribute": "other",
+            "recommendations": recommendations,
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+        }
+
+    def _respond_inner(
+        self,
+        session_id: str,
+        user_message: str,
+        turn: int,
+        top_k: int,
+    ) -> dict:
         state = self._state.get(session_id)
         if state is None:
+            # respond() before reset() -- no profile available; personalization
+            # simply stays empty rather than failing.
             state = self._state[session_id] = self._new_state()
         state["history"].append(user_message)
 
@@ -1068,23 +1565,19 @@ class Agent:
                 },
             }
 
-        # 4. Hybrid retrieval -- run BOTH tracks every turn and combine them with
-        #    Reciprocal Rank Fusion.
-        #      * BM25 track  : FTS5 tiered query -> top RRF_DEPTH (=60) ids
-        #      * Dense track : all-MiniLM-L6-v2 cosine top RRF_DEPTH (=60) ids
-        #    RRF: score(d) = sum over lists of  1 / (RRF_K + rank_in_list(d)).
-        #    (Dense list is empty -> this degrades to the pure BM25 ranking.)
-        bm25_ranked = self._bm25_ranked(state)
-        dense_ranked = self._dense_ranked(state, user_message)
-        fused = self._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=None)
-        if self._reranker is not None and fused:
-            head = self._rerank(
-                fused[:RERANK_CANDIDATES], self._dense_query_text(state, user_message),
-                bm25_ranked=bm25_ranked, dense_ranked=dense_ranked,
-            )
-            fused = head + fused[len(head):]
-        fused = fused[:top_k]
-        recommendations = [{"parent_asin": asin} for asin in fused]
+        # 4. Retrieval -- BM25 selects the candidates, semantics + profile reorder
+        #    them.  Any component that fails contributes nothing and the ranking
+        #    degrades cleanly toward pure BM25.
+        ranked = self._rank(state, user_message, top_k)
+        if ranked:
+            state["last_ranked"] = ranked
+        else:
+            # A turn can legitimately produce nothing -- an unparseable message,
+            # or an override that just cleared the constraint set.  Returning the
+            # last good list is strictly better than returning none: the shopper's
+            # earlier constraints were valid, and an empty turn cannot score.
+            ranked = state["last_ranked"][:top_k]
+        recommendations = [{"parent_asin": asin} for asin in ranked]
 
         if state["exhausted"]:
             ask_attribute = None
