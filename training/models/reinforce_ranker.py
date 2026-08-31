@@ -53,19 +53,33 @@ def _sample_plackett_luce(scores: np.ndarray, rng: np.random.Generator):
 
 
 class ReinforceRanker:
-    def __init__(self, lr: float = 0.05, epochs: int = 30, momentum: float = 0.9,
-                 entropy_coef: float = 0.01, seed: int = 42):
+    def __init__(self, lr: float = 0.01, epochs: int = 30, momentum: float = 0.9,
+                 entropy_coef: float = 0.01, seed: int = 42, grad_clip: float = 1.0):
         self.lr = lr
         self.epochs = epochs
         self.momentum = momentum
         self.entropy_coef = entropy_coef
         self.seed = seed
+        self.grad_clip = grad_clip
         self.weights_: np.ndarray | None = None
         self.bias_: float = 0.0
+        self.feat_mean_: np.ndarray | None = None
+        self.feat_std_: np.ndarray | None = None
         self.reward_history_: list[float] = []  # one entry per group update, for plotting
 
     def fit(self, X: np.ndarray, y: np.ndarray, groups: np.ndarray) -> "ReinforceRanker":
         rng = np.random.default_rng(self.seed)
+        # Feature standardisation is essential here: the raw features span
+        # very different scales (lexical_score ~1.0 vs rrf_score ~0.015), and
+        # unnormalised gradient ascent on a softmax policy diverges -- it
+        # drove the weights strongly negative on the most informative
+        # features and produced a random/inverted ranking.
+        X = np.asarray(X, dtype=np.float64)
+        self.feat_mean_ = X.mean(axis=0)
+        self.feat_std_ = X.std(axis=0)
+        self.feat_std_[self.feat_std_ < 1e-8] = 1.0
+        X = (X - self.feat_mean_) / self.feat_std_
+
         w = np.array(BASELINE_WEIGHTS, dtype=np.float64)
         b = 0.0
         baseline = 0.0
@@ -88,14 +102,24 @@ class ReinforceRanker:
                 baseline = self.momentum * baseline + (1 - self.momentum) * reward
 
                 grad_w = grad_contrib @ Xg   # (n,) . (n, D) -> (D,)
-                w += self.lr * advantage * grad_w
-                b += self.lr * advantage * grad_b
+                update = self.lr * advantage * grad_w
+                norm = float(np.linalg.norm(update))
+                if norm > self.grad_clip:     # keep a single group from blowing up the policy
+                    update *= self.grad_clip / norm
+                w += update
+                b += float(np.clip(self.lr * advantage * grad_b, -self.grad_clip, self.grad_clip))
 
         self.weights_, self.bias_ = w, b
         return self
 
     def predict_scores(self, X: np.ndarray) -> np.ndarray:
-        return np.asarray(X, dtype=np.float64) @ self.weights_ + self.bias_
+        Xn = (np.asarray(X, dtype=np.float64) - self.feat_mean_) / self.feat_std_
+        return Xn @ self.weights_ + self.bias_
 
     def to_linear_ranker(self) -> LinearRanker:
-        return LinearRanker(self.weights_, self.bias_, name="reinforce")
+        """Fold the feature standardisation into the weight vector so the
+        artifact stays a plain `score = w.x + b` linear model at serving
+        time (LinearRanker applies no normalisation of its own)."""
+        w = self.weights_ / self.feat_std_
+        b = self.bias_ - float(np.dot(self.weights_, self.feat_mean_ / self.feat_std_))
+        return LinearRanker(w, b, name="reinforce")

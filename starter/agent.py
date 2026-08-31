@@ -171,21 +171,28 @@ RRF_K = int(os.environ.get("RRF_K", "60"))           # the "60" in 1 / (60 + ran
 # agent falls straight back to the plain RRF order -- identical to Day 4
 # behaviour. Never trains or calls any external service at serving time.
 #
-# ENABLED BY DEFAULT (GBDT). On the public set this is worth +0.0653
-# TechnicalScore over the plain RRF ordering -- 0.8260 vs. 0.7607 -- and it
-# improves every component metric: HitRate@10 0.955 vs 0.940, MRR 0.609 vs
-# 0.444, MTTC 2.71 vs 3.12.
+# ENABLED BY DEFAULT (simplex). On the public set this is worth +0.0803
+# TechnicalScore over the plain RRF ordering -- 0.8410 vs. 0.7607 -- and it
+# improves every component metric: HitRate@10 0.960 vs 0.940, MRR 0.649 vs
+# 0.444, MTTC 2.68 vs 3.12.  Other trained models, same evaluator run:
+# mlp 0.8362, gbdt 0.8260, coord_ascent 0.8244, ranksvm 0.8181.  Select any
+# of them with RERANK_MODEL=<name>; the margins between the top three are
+# small relative to a 200-session sample, so treat that ordering as
+# provisional (see docs/reranker_eval_results.md).
 #
-# That only holds for the v2 training formulation. An earlier v1 (labels
-# built from category siblings, no first-stage retrieval features) scored
-# BELOW the plain RRF order for all 7 model types -- best 0.7006, worst
-# 0.3344. See docs/reranker_eval_results.md for the root cause (label
-# leakage into sibling_max_sim + a training task that was nearly the
-# opposite of the real one) and what changed. Only GBDT is trained on the
-# current 14-feature schema; other RERANK_MODEL values have no artifact and
-# fall back to the plain RRF order.
+# Simplex is also the cheapest to serve: the artifact is an 11-number JSON
+# weight vector scored with one numpy dot product, so the default path needs
+# no lightgbm (nor torch/scipy/sklearn) at inference time.
+#
+# All of this holds only for the v2 training formulation. An earlier v1
+# (labels built from category siblings, no first-stage retrieval features)
+# scored BELOW the plain RRF order for every model type -- best 0.7006,
+# worst 0.3344, and simplex was that worst case. See
+# docs/reranker_eval_results.md for the root cause (label leakage into
+# sibling_max_sim, plus a training task that was nearly the opposite of the
+# real one) and what changed.
 RERANK_ENABLED = os.environ.get("RERANK_ENABLED", "1") not in ("0", "false", "False")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "gbdt")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "simplex")
 RERANK_ARTIFACTS_DIR = Path(
     os.environ.get("RERANK_ARTIFACTS_DIR", str(Path(__file__).resolve().parent / "reranker" / "artifacts"))
 )

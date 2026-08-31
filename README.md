@@ -86,35 +86,47 @@ Only exact `parent_asin` equality produces a hit. Core metrics are also reported
 ## Learned Re-Ranking Layer
 
 `starter/reranker/` + `training/` add a learned re-ranking stage that
-re-scores the top 60 of the BM25+dense RRF-fused list with a small,
-locally-trained GBDT (LightGBM LambdaRank) over 14 features: semantic
-similarity, lexical overlap, category-tree structure, and the first-stage
-BM25/dense/RRF rank scores. It is trained on self-supervised labels built
-from the catalog itself -- no manual labeling and no paid API calls.
+re-scores the top 60 of the BM25+dense RRF-fused list over 14 features:
+semantic similarity, lexical overlap, category-tree structure, and the
+first-stage BM25/dense/RRF rank scores. It is trained on self-supervised
+labels built from the catalog itself -- no manual labeling and no paid API
+calls.
 
-**Enabled by default, worth +0.0653 TechnicalScore** on the public set,
+**Enabled by default, worth +0.0803 TechnicalScore** on the public set,
 measured with the unmodified `evaluator/local_evaluator.py`:
 
-| Run | HitRate@10 | MRR | MTTC | TechnicalScore |
+| Configuration | HitRate@10 | MRR | MTTC | TechnicalScore |
 |---|---|---|---|---|
+| **simplex (default)** | 0.960 | **0.649** | 2.68 | **0.8410** |
+| mlp | **0.965** | 0.624 | **2.67** | 0.8362 |
+| gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
+| coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
+| ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
 | no re-ranking | 0.940 | 0.444 | 3.12 | 0.7607 |
-| **with re-ranking (GBDT)** | **0.955** | **0.609** | **2.71** | **0.8260** |
 
-Every component metric improves, with the biggest gain in MRR (+37%
-relative) -- the target lands much closer to rank 1 when found.
+Every trained model beats the plain RRF ordering on every component metric,
+with the biggest gain in MRR (+46% relative for the default) -- the target
+lands much closer to rank 1 when found. The default is the simplex-constrained
+linear model: it scored highest here, and its artifact is an 11-number weight
+vector scored with a single numpy dot product, so the default serving path
+needs no lightgbm, torch, scipy or sklearn. Any other model is selectable with
+`RERANK_MODEL=<name>`; note the top three sit within ~0.015 of each other on a
+200-session sample, so see `docs/reranker_eval_results.md` before reading much
+into that ordering.
 
 Seven model types are implemented (fixed baseline, Simplex-constrained
 linear, RankSVM, Coordinate Ascent, MLP, REINFORCE, GBDT, plus a GBDT+MLP
-ensemble); GBDT is the one trained on the current feature schema and shipped.
-An earlier training formulation scored *below* plain RRF for all seven models
--- the root-cause analysis (label leakage and a training task that was nearly
-the opposite of the real one) and what changed is documented in
-`docs/reranker_eval_results.md`. See `notebooks/training_pipeline.ipynb` and
+ensemble). An earlier training formulation scored *below* plain RRF for all
+seven -- the root-cause analysis (label leakage, and a training task that was
+nearly the opposite of the real one) is documented in
+`docs/reranker_eval_results.md`, along with caveats on the small margins
+between the top models. See `notebooks/training_pipeline.ipynb` and
 `notebooks/model_comparison.ipynb` to reproduce training and inspect
 performance.
 
 Reproduce: `python -m training.label_generation` then
-`python -m training.train_all --models gbdt`. Disable with `RERANK_ENABLED=0`.
+`python -m training.train_all`. Select a model with `RERANK_MODEL=<name>`;
+disable entirely with `RERANK_ENABLED=0`.
 
 Runtime cost/dependency disclosure: training and label generation run
 entirely offline -- no external API calls, no added inference-time token cost

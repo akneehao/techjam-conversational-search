@@ -4,23 +4,67 @@ Official `evaluator/local_evaluator.py` results (200-session public set,
 unmodified evaluator) for the Day 5 re-ranking layer (`starter/reranker/` +
 `training/`).
 
-## Headline: v2 ships enabled, worth +0.0653 TechnicalScore
+## Headline: v2 ships enabled, worth +0.0803 TechnicalScore
 
-| Run | HitRate@10 | MRR | MTTC | TechnicalScore |
+Every model retrained on the v2 formulation, each a full
+`evaluator/local_evaluator.py` run on the 200 public sessions:
+
+| Configuration | HitRate@10 | MRR | MTTC | TechnicalScore |
 |---|---|---|---|---|
+| **simplex (shipped default)** | 0.960 | **0.649** | 2.68 | **0.8410** |
+| mlp | **0.965** | 0.624 | **2.67** | 0.8362 |
+| gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
+| coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
+| ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
 | control (no re-ranking) | 0.940 | 0.444 | 3.12 | 0.7607 |
 | v1 GBDT (superseded) | 0.885 | 0.483 | 5.34 | 0.7006 |
-| **v2 GBDT (shipped default)** | **0.955** | **0.609** | **2.71** | **0.8260** |
 
-v2 improves every component metric, with the largest gain exactly where a
-re-ranker should deliver it: **MRR +37% relative** (0.444 -> 0.609) -- when the
-target is retrieved it now lands much closer to rank 1. It also finds the
-target slightly more often (0.955 vs 0.940) and sooner (2.71 vs 3.12 turns).
+Every v2 model beats the control, and every one improves every component
+metric. The largest gain is exactly where a re-ranker should deliver it:
+**MRR +46% relative** for the shipped simplex (0.444 -> 0.649) -- when the
+target is retrieved it lands much closer to rank 1. Targets are also found
+slightly more often and roughly half a turn sooner.
 
-Only GBDT is trained on the current 14-feature schema. The other six model
-types remain implemented and runnable (`python -m training.train_all --models
-...`) but were not retrained on v2 data under hackathon time constraints;
-their `RERANK_MODEL` values have no artifact and fall back to plain RRF.
+**Simplex is the shipped default** (`RERANK_MODEL=simplex`), for two reasons:
+it scored highest here, and its artifact is an 11-number weight vector scored
+with a single numpy dot product, so the default serving path needs no
+lightgbm, torch, scipy or sklearn at inference. Any other model is selectable
+with `RERANK_MODEL=<name>`.
+
+Two caveats to carry into any further tuning:
+
+- The top four models sit within ~0.023 of each other, and the training set
+  has only 601 positive examples (601 training query groups; see below).
+  A single session is worth ~0.005 HitRate@10 on a 200-session set, so treat
+  the ordering among simplex/mlp/gbdt as provisional rather than decisive.
+- **Simplex was the *worst* model in v1 (0.3344) and is the best in v2.** That
+  reversal is informative rather than surprising: it is the most constrained
+  model (weights non-negative, summing to 1), so v1's leaked feature damaged
+  it most, while on v2's honest features and a small training set its low
+  effective capacity makes it the most resistant to overfitting.
+
+### Training set size
+
+| | |
+|---|---|
+| Query groups | 751 (1.5% of the 50,000-product catalog) |
+| Candidates per query | 60 |
+| Rows (query-candidate pairs) | 45,060 |
+| Positive examples | 751 -- one per query |
+| Train / test split | 601 groups (601 positives) / 150 groups (150 positives) |
+
+The row count overstates the real sample size: the 36k training rows encode
+601 decisions, each padded with 59 negatives. Raising `--num-queries` is the
+most promising remaining lever -- it attacks the actual bottleneck, and would
+also make the model comparison above decisive rather than noise-limited.
+
+REINFORCE is excluded from the table. On the v2 features it initially
+diverged outright (weights driven strongly negative on the most informative
+features, producing a random/inverted ranking at MRR 0.017 ~ 1/60). The cause
+was unnormalised gradient ascent over features spanning very different scales
+(`lexical_score` ~1.0 vs `rrf_score` ~0.015). Adding feature standardisation
+and gradient clipping fixed the divergence (offline MRR 0.017 -> 0.320), but
+it remains far below the other six, so it was not worth an evaluator run.
 
 ## v1 results (superseded)
 

@@ -5,21 +5,33 @@ you need to regenerate locally.
 
 ## TL;DR
 
-A learned GBDT re-ranker now re-scores the top 60 of the RRF-fused candidate
-list before the top 10 are returned. Measured with the **unmodified**
+A learned re-ranker now re-scores the top 60 of the RRF-fused candidate list
+before the top 10 are returned. All models measured with the **unmodified**
 `evaluator/local_evaluator.py` on the 200 public sessions:
 
-| Run | HitRate@10 | MRR | MTTC | TechnicalScore |
+| Configuration | HitRate@10 | MRR | MTTC | TechnicalScore |
 |---|---|---|---|---|
+| **simplex (shipped default)** | 0.960 | **0.649** | 2.68 | **0.8410** |
+| mlp | **0.965** | 0.624 | **2.67** | 0.8362 |
+| gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
+| coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
+| ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
 | without re-ranking (your pipeline) | 0.940 | 0.444 | 3.12 | 0.7607 |
-| **with re-ranking (shipped)** | **0.955** | **0.609** | **2.71** | **0.8260** |
 
-**+0.0653 TechnicalScore**, improving every component metric. Biggest gain is
-MRR (+37% relative) -- the target lands much closer to rank 1 when found.
+**+0.0803 TechnicalScore** for the default, improving every component metric.
+Biggest gain is MRR (+46% relative) -- the target lands much closer to rank 1
+when found.
 
-It ships **enabled** (`RERANK_ENABLED=1`, `RERANK_MODEL=gbdt`). Turn it off
-with `RERANK_ENABLED=0`; it also degrades to the plain RRF order on its own if
-lightgbm, the model file, or the dense track is unavailable.
+It ships **enabled** (`RERANK_ENABLED=1`, `RERANK_MODEL=simplex`). Simplex is
+also the cheapest to serve: an 11-number weight vector and one numpy dot
+product, so the default path needs no lightgbm at inference. Switch models
+with `RERANK_MODEL=<name>`, or turn it off with `RERANK_ENABLED=0`; it also
+degrades to the plain RRF order on its own if a dependency, the artifact, or
+the dense track is unavailable.
+
+Caveat: the top three models are within ~0.015 of each other on 200 sessions,
+and training used only 601 positive examples -- so don't read the ordering as
+settled. More training data (`--num-queries`) is the most promising next lever.
 
 ## Committed to git -- you get these on pull
 
