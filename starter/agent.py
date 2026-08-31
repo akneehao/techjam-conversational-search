@@ -333,23 +333,30 @@ CROSS_WEIGHT = float(os.environ.get("CROSS_WEIGHT", "0.60"))
 # stage (meta fusion_mode=rerank), then run through the official evaluator on
 # the fixed pipeline:
 #
-#   model          offline MRR (993 held-out groups)   evaluator (200 sessions)
-#   ranksvm            0.9476  (2nd, 1st on hits@1)        0.84849   <- default
-#   simplex            0.9398  (5th)                       0.84848
-#   mlp                0.9444  (4th)                       0.8431
-#   gbdt               0.9477  (1st)                       0.8250
-#   reinforce          0.6810  -- BELOW the 0.7298 first-stage baseline
+#   model        offline MRR (993 groups)   evaluator (200 sessions)
+#   ranksvm         0.9476  (2nd, 1st hits@1)    0.84849  (1st)  <- default
+#   simplex         0.9398  (5th)                0.84848  (2nd)
+#   coord_ascent    0.9464  (3rd)                0.84675  (3rd)
+#   mlp             0.9444  (4th)                0.84311  (4th)
+#   gbdt            0.9477  (1st)                0.82499  (5th)
+#   reinforce       0.6810  -- BELOW the 0.7298 first-stage baseline
 #   (simplex on the older 751-query set scored 0.8498)
 #
 # Two things that ranking settles:
 #
-# 1. THE OFFLINE TEST SET CANNOT BE TRUSTED ALONE.  It is a held-out split of
-#    the same self-supervised distribution used for training (queries built
-#    from product text with token dropout + filler words), while the evaluator
-#    uses templated shopper messages.  gbdt tops the offline table and comes
-#    LAST on the evaluator, 0.024 behind.  It is the only tree model, so it can
-#    fit sharp splits on the synthetic query style that do not survive the
-#    distribution shift.  Selecting on offline metrics alone would ship it.
+# 1. THE OFFLINE TEST SET IS BLIND AT THE TAILS.  It is a held-out split of the
+#    same self-supervised distribution used for training (queries built from
+#    product text with token dropout + filler words), while the evaluator uses
+#    templated shopper messages.  The MIDDLE of the table transfers perfectly --
+#    ranksvm / coord_ascent / mlp hold offline ranks 2,3,4 and evaluator ranks
+#    1,3,4.  Both EXTREMES invert:
+#      * gbdt is 1st offline and LAST on the evaluator, 0.024 behind.  It is the
+#        only tree model, so it fits sharp splits on the synthetic query style
+#        that do not survive the distribution shift.
+#      * simplex is LAST offline and 2nd on the evaluator: too degenerate to fit
+#        the synthetic style, hence invariant to the shift.
+#    Capacity buys offline score and costs transfer.  Since a default is chosen
+#    from the tail, offline metrics alone would have shipped the worst model.
 #
 # 2. THE TOP THREE ARE TIED.  ranksvm 0.84849, simplex/5k 0.84848 and
 #    simplex/751 0.8498 sit inside a quarter of one session on a 200-session
