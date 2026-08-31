@@ -9,7 +9,9 @@ Build an AI shopping agent that asks useful follow-up questions and recommends t
 - A weak BM25 starter agent and deterministic local evaluator.
 - The Agent API contract and scoring rules.
 
-The organizer keeps 800 additional sessions private for final evaluation.
+The organizer keeps 800 additional sessions unreleased until the Devpost submission deadline. After the deadline, the final evaluation package will be released and teams will run the unmodified official evaluator in their own environments using their frozen submitted commit.
+
+See [`docs/final_evaluation_faq.md`](docs/final_evaluation_faq.md) for the final evaluation, network, credentials, hardware, data, and scoring policy.
 
 ## Task
 
@@ -145,6 +147,7 @@ Teams may use any legally accessible LLM API or local model. Teams manage their 
 ```text
 data/public_set.jsonl             200 labeled development sessions
 docs/competition_specification.md participant rules and evaluation protocol
+docs/final_evaluation_faq.md      final evaluation and judging clarifications
 docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
@@ -159,9 +162,7 @@ evaluator/local_evaluator.py      public-set simulator and scorer
 ## Judging and Submission Policy
 
 - Participant submission requirements: `docs/submission_rules.md`
-- Organizer-only final judging controls: `organizer/JUDGING_RUNBOOK.md`
-- Organizer private release checklist: `organizer/private_release_checklist.md`
-- Judging day operations SOP: `organizer/JUDGING_DAY_SOP.md`
+- Final evaluation FAQ: `docs/final_evaluation_faq.md`
 
 ## Data Source
 
