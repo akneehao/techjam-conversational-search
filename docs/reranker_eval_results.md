@@ -4,59 +4,70 @@ Official `evaluator/local_evaluator.py` results (200-session public set,
 unmodified evaluator) for the Day 5 re-ranking layer (`starter/reranker/` +
 `training/`).
 
-## Headline: v2 ships enabled, worth +0.0803 TechnicalScore
+## Headline: v2 ships enabled, worth +0.0811 TechnicalScore
 
-Every model retrained on the v2 formulation, each a full
-`evaluator/local_evaluator.py` run on the 200 public sessions:
+Every configuration is a full `evaluator/local_evaluator.py` run on the 200
+public sessions. "3k" models are trained on 2,972 queries, "751q" on 751.
 
 | Configuration | HitRate@10 | MRR | MTTC | TechnicalScore |
 |---|---|---|---|---|
-| **simplex (shipped default)** | 0.960 | **0.649** | 2.68 | **0.8410** |
-| mlp | **0.965** | 0.624 | **2.67** | 0.8362 |
-| gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
-| coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
-| ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
+| 3k simplex | **0.970** | 0.640 | 2.65 | **0.8440** |
+| **3k gbdt (shipped default)** | 0.960 | **0.649** | 2.65 | 0.8418 |
+| 751q simplex | 0.960 | **0.649** | 2.68 | 0.8410 |
+| 3k mlp | 0.965 | 0.627 | **2.63** | 0.8380 |
+| 751q mlp | 0.965 | 0.624 | 2.67 | 0.8362 |
+| 751q coord_ascent | 0.945 | 0.622 | 2.73 | 0.8244 |
+| 751q gbdt | 0.955 | 0.609 | 2.71 | 0.8260 |
+| 751q ranksvm | 0.935 | 0.624 | 2.83 | 0.8181 |
 | control (no re-ranking) | 0.940 | 0.444 | 3.12 | 0.7607 |
 | v1 GBDT (superseded) | 0.885 | 0.483 | 5.34 | 0.7006 |
 
 Every v2 model beats the control, and every one improves every component
 metric. The largest gain is exactly where a re-ranker should deliver it:
-**MRR +46% relative** for the shipped simplex (0.444 -> 0.649) -- when the
-target is retrieved it lands much closer to rank 1. Targets are also found
-slightly more often and roughly half a turn sooner.
+**MRR +46% relative** (0.444 -> 0.649) -- when the target is retrieved it lands
+much closer to rank 1. Targets are also found slightly more often and roughly
+half a turn sooner.
 
-**Simplex is the shipped default** (`RERANK_MODEL=simplex`), for two reasons:
-it scored highest here, and its artifact is an 11-number weight vector scored
-with a single numpy dot product, so the default serving path needs no
-lightgbm, torch, scipy or sklearn at inference. Any other model is selectable
-with `RERANK_MODEL=<name>`.
+### Why GBDT is shipped over the nominally-higher simplex
 
-Two caveats to carry into any further tuning:
+Simplex scores 0.0022 above GBDT, which is under one session on a 200-session
+set. GBDT is preferred anyway, for two reasons:
 
-- The top four models sit within ~0.023 of each other, and the training set
-  has only 601 positive examples (601 training query groups; see below).
-  A single session is worth ~0.005 HitRate@10 on a 200-session set, so treat
-  the ordering among simplex/mlp/gbdt as provisional rather than decisive.
-- **Simplex was the *worst* model in v1 (0.3344) and is the best in v2.** That
-  reversal is informative rather than surprising: it is the most constrained
-  model (weights non-negative, summing to 1), so v1's leaked feature damaged
-  it most, while on v2's honest features and a small training set its low
-  effective capacity makes it the most resistant to overfitting.
+- **Simplex is degenerate.** It converges to `lexical_score = 1.0` with all 13
+  other weights *exactly* 0.0 -- at both training sizes, so this is a stable
+  property of the constrained formulation (non-negative weights summing to 1)
+  rather than a small-data fluke. It is purely a lexical-overlap ranker,
+  ignoring the dense, BM25 and RRF signals, and therefore has no graceful
+  behaviour if the hidden 800 sessions paraphrase rather than quote product
+  wording.
+- **The larger test set disagrees with the evaluator.** On the 594-group
+  offline test split -- roughly 3x the statistical power of 200 sessions --
+  the ordering is gbdt (0.9434 MRR) ~ mlp (0.9430) > coord_ascent (0.9402) >
+  ranksvm (0.9382) > **simplex last** (0.9356). When a larger, cleaner test
+  set contradicts a smaller one by 0.002, trust the larger.
 
-### Training set size
+Any model is selectable with `RERANK_MODEL=<name>`;
+`RERANK_ARTIFACTS_DIR=starter/reranker/artifacts` selects the 751-query set.
 
-| | |
-|---|---|
-| Query groups | 751 (1.5% of the 50,000-product catalog) |
-| Candidates per query | 60 |
-| Rows (query-candidate pairs) | 45,060 |
-| Positive examples | 751 -- one per query |
-| Train / test split | 601 groups (601 positives) / 150 groups (150 positives) |
+### Training set size, and what more data bought
 
-The row count overstates the real sample size: the 36k training rows encode
-601 decisions, each padded with 59 negatives. Raising `--num-queries` is the
-most promising remaining lever -- it attacks the actual bottleneck, and would
-also make the model comparison above decisive rather than noise-limited.
+| | 751-query set | 3k set (shipped) |
+|---|---|---|
+| Query groups | 751 (1.5% of catalog) | 2,972 (5.9%) |
+| Candidates per query | 60 | 60 |
+| Rows (query-candidate pairs) | 45,060 | 178,320 |
+| Positive examples | 751 -- one per query | 2,972 |
+| Train / test split | 601 / 150 groups | 2,378 / 594 groups |
+
+The row count overstates the real sample size: each positive is padded with 59
+negatives, so the positive count is what governs learning.
+
+Quadrupling the data lifted the *offline* metrics substantially but moved the
+*evaluator* score much less -- gbdt +0.0158, simplex +0.0030, mlp +0.0018.
+Diminishing returns have clearly set in, so another 4x is unlikely to pay for
+itself on its own. Note also that the two evaluations disagree about model
+ordering at this margin, which is itself a sign that 200 sessions cannot
+resolve differences this small.
 
 REINFORCE is excluded from the table. On the v2 features it initially
 diverged outright (weights driven strongly negative on the most informative
