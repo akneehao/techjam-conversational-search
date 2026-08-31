@@ -1,0 +1,13 @@
+# Core (Day 1 BM25 + Day 3 clarification): Python standard library only.
+#
+# Day 2 -- LLM intent router: calls Google Gemini via the REST API using urllib
+#   (stdlib). Set GEMINI_API_KEY (see .env) to enable. No package needed.
+#
+# Day 4 -- dense retrieval track (optional). Without these the agent is pure BM25
+#   and scores exactly as Day 1-3.
+#   First run with network builds a local vector cache (data/dense_*.npz);
+#   subsequent runs are fully offline and in-memory.
+numpy>=1.26
+sentence-transformers>=3.0
+# CPU-only torch is enough:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu

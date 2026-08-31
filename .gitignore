@@ -4,7 +4,10 @@ __pycache__/
 .env
 results.json
 data/catalog.jsonl
+data/catalog.jsonl.gz
 data/releases/
+# Day 4 dense-retrieval vector cache (regenerated from the catalog).
+data/dense_*.npz
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
 secure/
