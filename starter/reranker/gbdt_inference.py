@@ -33,13 +33,31 @@ class GBDTModel:
 
 
 def load_gbdt(path: str | Path) -> Optional[GBDTModel]:
+    """Load the LightGBM booster, tolerating CRLF-mangled model files.
+
+    The model is a .txt, so a Windows checkout with ``core.autocrlf=true``
+    rewrites its ~2,000 line endings to CRLF.  LightGBM's parser rejects that
+    with a **native abort** ("Model format error, expect a tree here") which
+    kills the interpreter outright -- ``except Exception`` cannot catch it, so
+    every downstream fallback in the agent is bypassed and the process dies at
+    ``Agent()`` construction.
+
+    Loading via ``model_str`` with normalised newlines avoids the abort
+    entirely, and works on checkouts that are already mangled.  ``.gitattributes``
+    marks these artifacts ``-text`` so fresh clones stay clean; this is the
+    belt-and-braces half, since it also repairs existing bad working copies.
+    """
     if _lgb is None:
         return None
     path = Path(path)
     if not path.is_file():
         return None
     try:
-        booster = _lgb.Booster(model_file=str(path))
+        raw = path.read_bytes()
+        if not raw.lstrip().startswith(b"tree"):
+            return None          # not a LightGBM text model -- do not hand it over
+        text = raw.replace(b"\r\n", b"\n").decode("utf-8", "replace")
+        booster = _lgb.Booster(model_str=text)
         return GBDTModel(booster)
     except Exception:
         return None

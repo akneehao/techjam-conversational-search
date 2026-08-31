@@ -56,7 +56,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # the category index that _init_reranker builds. Does not affect serving.
 os.environ.setdefault("RERANK_ENABLED", "1")
 
-from starter.agent import RRF_DEPTH, RRF_K, Agent, _tokens  # noqa: E402
+from starter.agent import (  # noqa: E402
+    DENSE_WEIGHT,
+    LEX_K,
+    RERANK_DEPTH,
+    RRF_DEPTH,
+    RRF_K,
+    Agent,
+    _tokens,
+)
 from starter.reranker.base import FEATURE_NAMES  # noqa: E402
 from starter.reranker.features import compute_feature_matrix  # noqa: E402
 from training.common import load_agent  # noqa: E402
@@ -133,13 +141,49 @@ def bm25_expressions(query_tokens: list[str]) -> list[str]:
 
 
 def retrieve_candidates(agent: Agent, query_text: str) -> tuple[list[str], list[str], list[str]]:
-    """Run the real first stage. Returns (fused, bm25_ranked, dense_ranked)."""
+    """Run the real first stage, whichever one is configured.
+
+    Returns ``(candidates, bm25_ranked, dense_ranked)``.
+
+    This MUST mirror ``Agent._rank``: the ordering it produces here is the
+    ordering the re-ranker will be asked to improve at serving time, and the
+    ``bm25_rank_score`` / ``dense_rank_score`` / ``rrf_score`` features are
+    computed from these two lists.  If the two diverge, the model is trained on
+    a candidate distribution it never sees in production.
+
+    It previously hardcoded ``_rrf_fuse``, which silently ignored FUSION_MODE.
+    With the first stage rewritten (BM25 gates, dense re-ranks within), that
+    left training pinned to the old symmetric-RRF ordering while serving used
+    the new one -- a train/serve mismatch that no amount of extra training data
+    would fix.
+    """
     query_tokens = _tokens(query_text)
     expressions = bm25_expressions(query_tokens)
-    bm25_ranked = agent._search(expressions, RRF_DEPTH, limit=RRF_DEPTH) if expressions else []
-    dense_ranked = agent._dense_rank(query_text, RRF_DEPTH)
-    fused = Agent._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=None)
-    return fused, bm25_ranked, dense_ranked
+    mode = getattr(agent, "_fusion_mode", "rrf")
+
+    if mode == "rrf":       # legacy symmetric fusion
+        bm25_ranked = agent._search(expressions, RRF_DEPTH, limit=RRF_DEPTH) if expressions else []
+        dense_ranked = agent._dense_rank(query_text, RRF_DEPTH)
+        return Agent._rrf_fuse(bm25_ranked, dense_ranked, k=RRF_K, top_k=None), bm25_ranked, dense_ranked
+
+    # rerank / bm25: BM25 fixes the candidate set, dense only reorders within it
+    depth = getattr(agent, "_rerank_depth", None) or RERANK_DEPTH
+    bm25_ranked = agent._search(expressions, depth, limit=depth) if expressions else []
+    if not bm25_ranked:
+        return [], [], []
+    if mode == "bm25":
+        return list(bm25_ranked), bm25_ranked, []
+
+    head = 1.0 / (LEX_K + 1)
+    scores = {a: (1.0 / (LEX_K + r)) / head for r, a in enumerate(bm25_ranked, start=1)}
+    dense_ranked: list[str] = []
+    if DENSE_WEIGHT > 0.0 and agent._dense_on():
+        dense_scores = agent._dense_scores(bm25_ranked, query_text)
+        dense_ranked = sorted(dense_scores, key=lambda a: dense_scores[a], reverse=True)
+        for asin, sem in Agent._minmax(dense_scores).items():
+            scores[asin] += DENSE_WEIGHT * sem
+    ordered = sorted(bm25_ranked, key=lambda a: scores.get(a, 0.0), reverse=True)
+    return ordered, bm25_ranked, dense_ranked
 
 
 def main() -> None:
@@ -164,7 +208,6 @@ def main() -> None:
     by_top: dict[str, list[str]] = defaultdict(list)
     for a in queryable:
         by_top[cat_index.path_by_asin[a][0]].append(a)
-
     # Proportional stratified sample with top-up. The catalog's top-level
     # buckets are extremely unbalanced (49,990 vs 10), so an even per-bucket
     # quota silently caps the sample far below --num-queries; allocate in
@@ -249,13 +292,20 @@ def main() -> None:
         candidate_ids=np.array(all_candidate_ids, dtype=object),
         query_list=np.array(accepted, dtype=object),
         meta=np.array([{
-            "version": 2,
+            "version": 3,
             "num_queries": len(accepted),
             "num_pairs": int(len(y)),
             "pos_rate": float(np.mean(y > 0)) if len(y) else 0.0,
             "not_retrieved": not_retrieved,
             "seed": args.seed,
             "feature_names": list(FEATURE_NAMES),
+            # v3: the first stage these candidates came from. A model trained on
+            # one mode and served under another sees a different candidate
+            # distribution -- record it so artifacts stay traceable.
+            "fusion_mode": getattr(agent, "_fusion_mode", "rrf"),
+            "rrf_k": RRF_K,
+            "rerank_depth": RERANK_DEPTH,
+            "dense_weight": DENSE_WEIGHT,
         }], dtype=object),
     )
     print(f"Wrote {out_path}: {len(accepted)} queries, {len(y)} pairs, "
