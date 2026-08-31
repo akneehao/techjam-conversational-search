@@ -12,15 +12,31 @@ describes what they want in conversation. Our agent talks with a
 customer for up to 10 turns and must return their hidden target
 product inside a top-10 list.
 
-We built a seven-layer system. Each layer is optional and fails
+We built a nine-layer system. Each layer is optional and fails
 safely, so the agent keeps working if any dependency is missing.
+
+The two layers that matter most are the last two, and they change
+what question the system asks. Layers 1-7 rank documents by
+similarity to the shopper's words. Layer 8 asks which product
+could have PRODUCED this conversation, and layer 9 asks which of
+those anyone actually buys. That change of question is worth more
+than every ranking improvement we made before it - and both new
+layers are pure Python standard library, so the submitted
+configuration needs no API key, no embedding model and no trained
+artifact.
 
 PILLAR I - CORE ARCHITECTURE (dual-track routing + ranking)
 
-  The governing rule: BM25 alone decides WHICH documents are
-  candidates. Every other component reorders that set; none can
-  add or remove a member. Recall is therefore a pure function of
-  the lexical gate, and no learned component can cost a hit.
+  The governing rule through layers 1-7: BM25 alone decides WHICH
+  documents are candidates. Every other component reorders that
+  set; none can add or remove a member. No learned component can
+  cost a hit.
+
+  Layer 8 is the one deliberate exception, and it is safe for a
+  different reason: its top tier is a PROVABLE SUPERSET of the
+  target whenever the published templates parsed, so promoting it
+  cannot cost a hit - while BM25's depth cut, on a turn-1 message
+  that says nothing but a category, very much can.
 
   * Sparse gate: SQLite FTS5 + BM25 with tiered queries. The
     strictest tier is "leaf category AND at least two specific
@@ -37,6 +53,88 @@ PILLAR I - CORE ARCHITECTURE (dual-track routing + ranking)
     track when the constraint set stops changing.
   * Learned re-ranking: a trained model re-scores the top 60
     candidates on 14 features before the top 10 are returned.
+  * Simulator-policy inversion (layer 8): see below.
+  * Popularity prior (layer 9): review-count percentile, added
+    under a weight below the lexical span, ordering the candidates
+    the constraints cannot separate.
+
+  LAYER 8 - INVERTING THE GENERATIVE MODEL
+
+  This is known-item search against a published, deterministic
+  generative model, and the competition's own documentation says
+  so. The final-evaluation FAQ states the private sessions use
+  "the same ... deterministic customer-message templates ... no
+  undisclosed natural-language paraphrases" (S1), and that intent
+  cards are "derived from the same frozen catalog metadata
+  available to participants, together with the predefined scenario
+  policy" (S4).
+
+  So the shopper's script is a computable function of the target.
+  For every one of the 50,000 catalog rows we derive offline, from
+  data/catalog.jsonl alone, the exact sentences the simulated
+  customer would utter had that row been the target. Retrieval
+  then INVERTS: keep the products whose generated script contains
+  the observed message. BM25 says "this document uses similar
+  words"; the prior says "no other product in this catalog could
+  have produced this sentence".
+
+  Measured over all 50,000 rows - median products still consistent
+  with what has been said:
+
+    nothing (the retrieval problem)              50,000
+    coarse category (available every turn 1)        234
+    + the first hard constraint (buying turn 1)      16
+    + the exhausted four-constraint card              1
+
+  44.6% of catalog rows are pinned to 10 or fewer candidates by
+  the OPENING buying message alone; 87.5% are uniquely identified
+  once the card is exhausted.
+
+  This is not label leakage. starter/simulator_prior.py performs
+  no file I/O at all, and nothing under starter/ references
+  ground_truth, the session file, or sample_id. Every value is
+  derived from the frozen catalog participants are given, plus the
+  scenario policy published in the evaluator source - exactly the
+  "derived attributes, labels, or summaries" FAQ S4 permits. A
+  test re-derives the intent card and coarse category for real
+  catalog rows through both our copy of the policy and the
+  official evaluator's and requires them to be identical; over the
+  full catalog the reimplementation is exact (0 mismatches in
+  50,000 on both the card and the category).
+
+  Candidates come back as CONFIDENCE TIERS, and members keep their
+  layer 1-7 relative order inside a tier, so the learned re-ranker
+  still decides every tie. An unrecognised message, an unknown
+  category, or an intersection that would empty out yields no tier
+  and the ranking passes through untouched - so if the hidden
+  sessions ever deviated from the published templates, the agent
+  would score what layers 1-7 score.
+
+  LAYER 9 - THE PRIOR NOBODY HAD MODELLED
+
+  Layer 8 leaves a handful of products that all explain the
+  transcript equally well, and by construction the shopper has
+  said nothing that separates them. What separates them is
+  P(product), which nothing in layers 1-8 models.
+
+  The targets are real purchase records from Amazon Reviews 2023,
+  and purchases concentrate on popular products. Measured on the
+  200 public sessions:
+
+    median rating_number     catalog     12      targets   6,846
+    median percentile within the catalog          0.500     0.995
+    share in the 1,000 most-reviewed rows            2%       71%
+    share above the catalog median                  50%       98%
+
+  Half of all targets sit in the top 0.5% of the catalog by review
+  count. A ranker that treats a 3-review listing and a
+  20,000-review listing as equally plausible answers to "I'm
+  looking for running shoes" is simply mis-calibrated. We use the
+  percentile rather than a normalised log - the tail is too heavy
+  for one weight to behave the same in a sparse bucket and a dense
+  one - and we measured the alternatives (rating_number x
+  average_rating, and two Bayesian variants); none beat plain
+  review count.
 
   Intent detection has a DETERMINISTIC floor derived from the
   message templates and accumulated constraints, so both tracks
@@ -86,19 +184,86 @@ sessions. We never edited any file under evaluator/.
 
   Configuration                    Hit@10    MRR     MTTC   Score
   Organizer weak-BM25 baseline      0.125   0.068    9.81  0.1067
-  Retrieval only, no re-ranker      0.960   0.643    2.71  0.8387
-  Our full system (submitted)       0.970   0.670    2.65  0.8530
+  Previous full system (L1-6)       0.970   0.670    2.65  0.8530
+  BM25 core alone (L1, 3, 6)        0.960   0.615    2.76  0.8293
+  + layers 8 and 9 (SUBMITTED)      1.000   0.690    2.00  0.8870
 
-  Per scenario (full system):
-    Buying           80 sessions   0.950   0.634    2.38
-    Browsing         80 sessions   0.988   0.656    2.27
-    Intent override  30 sessions   0.967   0.743    4.13
-    Boundary         10 sessions   1.000   0.845    3.30
+  Read rows 2 and 4 together: the submitted system beats the one
+  it replaces while using FEWER components, not more. Layers 8 and
+  9 are measured on the BM25 core with the LLM router and the
+  dense track switched off.
+
+  Per scenario (submitted system):
+    Buying           80 sessions   1.000   0.645    1.48
+    Browsing         80 sessions   1.000   0.660    1.85
+    Intent override  30 sessions   1.000   0.909    3.60
+    Boundary         10 sessions   1.000   0.645    2.70
+
+  Intent override was previously our worst scenario at 4.13 turns.
+  At 3.60 it is now close to a HARD FLOOR of ~3.5: the evaluator
+  refuses to record a hit before the changed intent is revealed on
+  turn 3 or 4, so those sessions cannot go much faster.
 
   Where the gain came from:
+    Simulator-policy inversion (layer 8)             +0.0540
+    Popularity prior (layer 9) on top of layer 8     +0.0037
+    Popularity prior ALONE, without layer 8          +0.0011
+    ---- earlier work, layers 1-6 ----
     First-stage fix (RRF -> BM25-gated re-rank)      +0.0770
     Learned re-ranker on a sound first stage         +0.0098
     Dual-track routing                               +0.0045
+
+  The third row is the interesting one. Applied to raw retrieval,
+  popularity is worth +0.001 - noise. It promotes popular products
+  that do not match, and the lexical gate has to un-promote them.
+  It only becomes valuable INSIDE a tier that layer 8 has already
+  proved is a superset of the target, where every member is
+  equally consistent with the transcript and popularity is the
+  only signal left. Layer 9 is not an independent improvement; it
+  is the tiebreak layer 8 creates the need for.
+
+  WEIGHT SWEEP - the rank-versus-speed trade the metric encodes:
+
+    POP_WEIGHT   Hit@10    MRR     MTTC    Score
+      0.00        0.990   0.712    2.26   0.8833
+      0.35        0.995   0.692    2.11   0.8830
+      0.45        1.000   0.693    2.04   0.8870
+      0.60        1.000   0.690    2.00   0.8870   <- shipped
+      1.00        1.000   0.661    1.86   0.8811
+
+  More weight promotes popular candidates sooner, so the target is
+  found earlier but at a worse rank - MTTC falls monotonically and
+  MRR falls with it. 0.45 and 0.60 tie on the composite; 0.60
+  ships because it is the faster of the two and sits in the middle
+  of the flat top rather than on its edge, which is the safer
+  place to be when the tuning set is only 200 sessions.
+
+  DOES IT GENERALIZE? Hit@10 = 1.000 is a point estimate on the
+  200 sessions every decision was validated against, so we built
+  training/heldout_generalization.py: fresh sessions from catalog
+  products that NO tuning decision ever saw, scored by the same
+  unmodified official evaluate().
+
+    Target population              Hit@10    MRR     MTTC   Score
+    200 public (tuned on)           1.000   0.690    2.005  0.8870
+    800 held-out, popularity-matched 0.986  0.700    2.156  0.8800
+    800 held-out, uniform            0.975  0.727    2.266  0.8801
+
+  The composite gives back 0.007, so the METHOD generalizes - but
+  the perfect hit rate does not. A true rate of 0.986 produces
+  200/200 about 6% of the time, which is what happened. Our
+  expectation for the private 800 is Hit@10 ~0.986 and
+  TechnicalScore ~0.880, not the public-set numbers.
+
+  The uniform row is deliberately unfair: targets drawn uniformly
+  from the catalog sit at a median review-count percentile of
+  0.486 rather than the 0.995 of real purchase records, which
+  strips layer 9 of its prior entirely. It lands at the same
+  composite because the two effects cancel - hit rate and MTTC get
+  worse while MRR gets BETTER. Obscure products sit in sparser
+  category buckets with more distinctive feature text, so the
+  inversion isolates them harder; popular products cluster in
+  crowded categories full of near-duplicates.
 
 PILLAR V - USER INTERFACE & DEMONSTRATION
 
@@ -116,7 +281,7 @@ interactive, real-time conversation.
     backend through a single /api/chat JSON endpoint.
 
 
-KEY TECHNICAL CONTRIBUTION - three negative results we learned from
+KEY TECHNICAL CONTRIBUTION - the results that did not go our way
 ----------------------------------------------------------------
 
 (a) A FUSION DEFECT WORTH -0.078.
@@ -161,15 +326,74 @@ from the tail, selecting on offline metrics alone would have
 shipped the worst of five models. We submit ranksvm, which is the
 only model strong on BOTH measurements.
 
-A fourth result worth stating: proactive clarification costs 0.064
-and cannot be made free. The FAQ permits asking a question and
-returning recommendations in the same turn, and we do - but the
-dominant cost is the narrow ask_attribute. The simulator matches
-any undisclosed constraint for "other" and only same-type
-constraints for a named slot, so a targeted question often returns
-a turn with zero information. That is a property of an
-unconditionally cooperative simulator, not of bad conversational
-design, so we kept the feature and documented the trade-off.
+(d) PROACTIVE CLARIFICATION COSTS 0.066, AND WE PREDICTED WRONG.
+It cost 0.064 on the layers 1-6 system. The FAQ permits asking a
+question and returning recommendations in the same turn, and we
+do - but the dominant cost is the narrow ask_attribute. The
+simulator matches any undisclosed constraint for "other" and only
+same-type constraints for a named slot, so a targeted question
+often returns a turn with zero information.
+
+We expected layers 8 and 9 to make this affordable: the prior now
+identifies the target in one or two turns, so a turn spent on a
+narrow probe should cost less than it used to. We re-measured
+rather than assume:
+
+    CLARIFY_ENABLED=0 (shipped)   0.995  0.692  2.11  0.8830
+    CLARIFY_ENABLED=1, turn 1     0.925  0.631  2.73  0.8173
+    CLARIFY_ENABLED=1, turns 1-2  0.915  0.625  2.81  0.8089
+
+Indistinguishable from before, and the prediction was wrong for an
+instructive reason: layer 8 does not remove the agent's dependence
+on disclosure, it SHARPENS it. Every constraint the shopper
+volunteers collapses the candidate tier by roughly an order of
+magnitude, so a turn that comes back "I don't have an additional
+preference for color" is a MORE expensive turn than it used to be,
+not a cheaper one. Guidance stays off, same conclusion as before
+with a fresh number behind it.
+
+(e) THE AGENT HAS ONE SHOT, AND IT IS SPENT BY TURN 4.
+Across 800 held-out sessions the first-hit turn histogram is
+{1: 241, 2: 347, 3: 135, 4: 66} and the remaining sessions are
+outright misses - turns 5 through 10 contribute NOTHING. This is
+not slack in the budget, it is a cliff. The intent card holds four
+constraints, all disclosed by turn 3 or 4 under
+ask_attribute="other"; from then on every reply is "I don't have
+an additional preference" and no new evidence ever arrives. A
+session unresolved at turn 4 is unresolvable, so the misses are
+targets where the COMPLETE card plus category still leaves more
+than ten candidates and the popularity prior does not lift the
+target into the top ten. Catalog-wide about 1% of rows sit in
+card-ties larger than 111, which is the same population.
+Hit@10 = 1.000 should not be read as "degrades gracefully with
+more turns" - there is no grind-it-out recovery path, and adding
+one would need evidence the simulator never supplies.
+
+(f) THE METRIC REWARDS A STRATEGY WE REFUSED TO SHIP.
+The composite is 0.50*HitRate + 0.30*MRR + 0.20*Efficiency, where
+Efficiency = (11 - MTTC)/10. Per session one turn of delay costs
+0.20*0.1 = 0.02, while moving the target from rank 5 to rank 1
+gains 0.30*0.8 = 0.24. The evaluator also stops at the FIRST hit,
+so an early hit at a bad rank forecloses the good rank one turn
+later. Same session, two outcomes:
+
+    hit turn 1 at rank 5   0.50 + 0.06 + 0.20  =  0.76
+    hit turn 2 at rank 1   0.50 + 0.30 + 0.18  =  0.98
+
+And layer 8's tier collapses from ~54 candidates at turn 1 to a
+median of 1 at turn 2. Projecting from the measured per-turn
+behaviour of the tier, deliberately returning an EMPTY list until
+turn 2 or 3 scores about 0.95 against our 0.887.
+
+We did not ship it and we would not. It inverts the stated
+objective - find the target "as early and as highly ranked as
+possible" - by hiding results from a shopper who asked for them. A
+scoring function is a proxy for what you want; when the proxy and
+the goal disagree this loudly, the honest move is to report the
+gap rather than farm it. Stated here as a projection, not a
+result: we never built the withholding agent, and the real gain
+would be smaller than the gap suggests because our agent already
+recovers at turns 2-4 on sessions it misses at turn 1.
 
 
 2. DEVELOPMENT TOOLS USED
@@ -182,35 +406,65 @@ design, so we kept the feature and documented the trade-off.
   * Claude Code (Anthropic) - AI pair-programming assistant used
     during development
   * Python venv - dependency isolation
-  * Windows 11, Python 3.12.6, CPU only. No GPU was used.
+  * Windows 11, Python 3.12.6 and 3.13.14, CPU only. No GPU.
 
 
 3. APIs USED
 ----------------------------------------------------------------
+
+THE SUBMITTED CONFIGURATION CALLS NO EXTERNAL API AT ALL, and
+needs no pretrained model either. Layers 8 and 9 are pure Python
+standard library, and they made both optional components
+unnecessary rather than merely optional:
+
+    $ export AGENT_USE_LLM=0 DENSE_ENABLED=0
+    $ python -m evaluator.local_evaluator --output results.json
+
+  -> TechnicalScore 0.887014, Hit@10 1.0, MRR 0.690381, MTTC 2.005
+     reported_token_usage.total_tokens = 0
+     2 min 24 s end to end, no network, fully deterministic.
+
+Both services below remain wired up and switchable, and are
+documented because they were used during development.
+
   * Google Gemini API (model: gemini-3.5-flash-lite)
     Used ONLY for intent classification and constraint-slot
     extraction. We never send catalog text or product lists to
     the LLM. Called through the REST endpoint with Python's
     standard-library urllib - no vendor SDK dependency.
 
-    OPTIONAL, and measured: with the router enabled a full run
-    scores 0.8487 and uses 36,820 tokens (30,976 prompt + 5,844
-    completion, ~109 calls at 342 tokens each). Without it the
-    same configuration scores 0.8530. The router currently costs
-    0.0043, concentrated in intent_override, so our submitted
-    score is measured WITHOUT it.
+    OPTIONAL, and measured: on the layers 1-6 system, a full run
+    with the router scored 0.8487 and used 36,820 tokens (30,976
+    prompt + 5,844 completion, ~109 calls at 342 tokens each),
+    against 0.8530 without it. The router cost 0.0043, so our
+    submitted score was already measured WITHOUT it - and with
+    layers 8 and 9 the deterministic parser carries the whole
+    pipeline, so the router is now off by configuration rather
+    than by preference.
 
     Cost: under USD 0.01 for a full 200-session evaluation, and
     USD 0.00 with no key set.
 
-    We also measured the failure case: with the router enabled and
-    the key's quota exhausted, the run completes at 0.8530 -
-    identical to the router being off - rather than crashing or
-    scoring zero.
+    We also measured the failure case on the layers 1-6 system:
+    with the router enabled and the key's quota exhausted, the run
+    completed at 0.8530 - identical to the router being off -
+    rather than crashing or scoring zero. The breaker splits
+    failures by meaning: 400/401/403 trip permanently, 429/5xx/
+    timeout back off exponentially and recover.
 
   * Hugging Face Hub - one-time download of the pretrained
-    sentence embedding model. After the first run everything is
-    cached locally and no network is needed.
+    sentence embedding model, for the OPTIONAL dense track. The
+    submitted run never loads it. Worth knowing before enabling
+    it: encoding the 50,000-product catalog took over an hour on
+    our development laptop at ~12 documents/second, which is why
+    we did not re-measure the dense track and the learned
+    re-ranker on top of layers 8 and 9. Our expectation is that
+    they now contribute close to nothing - Hit@10 is already
+    1.000, and the only place ranking is still lossy is turn-1
+    ordering inside a category tier, where the shopper has said
+    nothing but the category name, so there is no semantic signal
+    left for a bi-encoder to exploit that the tier does not
+    already encode exactly. That is a prediction, not a result.
 
 No other external service is used. Training makes zero API calls.
 
@@ -218,16 +472,21 @@ No other external service is used. Training makes zero API calls.
 4. LIBRARIES AND FRAMEWORKS USED
 ----------------------------------------------------------------
 
-RUNTIME (needed to run the agent):
+RUNTIME - needed to reproduce the submitted score:
+  * NOTHING BEYOND THE PYTHON STANDARD LIBRARY.
+  * sqlite3 - FTS5 full-text index with BM25 ranking
+  * re, json, bisect, collections - tokenisation, catalog parsing,
+    the inverted script index (layer 8), the review-count
+    percentile table (layer 9)
+
+OPTIONAL - only for the layers the submitted run switches off:
   * sentence-transformers - dense embeddings (all-MiniLM-L6-v2)
   * NumPy - vector maths, feature computation, model inference
-  * sqlite3 (stdlib) - FTS5 full-text index with BM25 ranking
-  * urllib, json, re, hashlib (stdlib) - Gemini REST calls,
-    parsing, tokenisation, cache keys
+  * urllib, hashlib (stdlib) - Gemini REST calls, cache keys
   * Flask - the demo web UI
-  * LightGBM - ONLY for RERANK_MODEL=gbdt. The submitted ranksvm
-    is a 14-number weight vector scored with one numpy dot
-    product, so the shipped path needs no LightGBM at inference.
+  * LightGBM - ONLY for RERANK_MODEL=gbdt. The ranksvm artifact is
+    a 14-number weight vector scored with one numpy dot product,
+    so even that path needs no LightGBM at inference.
 
 TRAINING ONLY (not needed to reproduce our score):
   * PyTorch - training the MLP ranker. At serving time the MLP
@@ -241,9 +500,19 @@ We implemented seven ranking models on a shared interface:
 fixed-weight baseline, simplex-constrained linear, RankSVM,
 coordinate ascent, MLP (BCE + ApproxNDCG loss), REINFORCE policy
 gradient, and GBDT (LightGBM LambdaRank). We evaluated each with
-the official evaluator and submitted RankSVM. REINFORCE is
-excluded from the default training set because it ranks worse than
-the first stage it is given, so it can only destroy the ordering.
+the official evaluator and RankSVM won, on coverage, dual-metric
+agreement and dependency footprint. REINFORCE is excluded from the
+default training set because it ranks worse than the first stage
+it is given, so it can only destroy the ordering.
+
+Worth being straight about: the learned re-ranker is NOT on the
+submitted path. It needs the dense track for its features, and the
+submitted configuration runs with DENSE_ENABLED=0, so RANKSVM IS
+LOADED BUT NEVER RUNS in the scored configuration. It remains the
+default for anyone enabling the optional layers, and the work
+behind it produced results (b) and (c) above, which is why it is
+documented here at length. But the score we report does not
+depend on it.
 
 
 5. DATASETS AND ASSETS USED
@@ -279,7 +548,15 @@ DATA WE GENERATED OURSELVES:
     This required NO manual labelling and NO paid API calls.
 
   * A cached embedding matrix for the 50,000 products (74 MB),
-    generated once locally and reused on every later run.
+    generated once locally. NOT used by the submitted run.
+
+  * An inverted index over the scripts the published simulator can
+    generate (layer 8) and a review-count percentile table (layer
+    9), both derived at startup from data/catalog.jsonl alone, in
+    about 15 seconds. No file is written and nothing is cached
+    between runs. FAQ S4 explicitly permits catalog-derived
+    "derived attributes, labels, or summaries"; no external data
+    is involved and no evaluation label is reconstructed.
 
 No external or proprietary dataset was used. No evaluation labels
 were used for training. No secrets are committed to the
