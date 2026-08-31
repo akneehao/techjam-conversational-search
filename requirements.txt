@@ -9,6 +9,8 @@
 #   subsequent runs are fully offline and in-memory.
 numpy>=1.26
 sentence-transformers>=3.0
+Flask==2.2.5
+Werkzeug==2.2.3
 # CPU-only torch is enough:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 #

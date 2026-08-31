@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shopping Assistant — AI product finder & advisor</title>
+<meta
+name="description"
+content="Chat with an AI shopping assistant that finds products, compares options and recommends what to buy."
+/>
+<style>
+:root {
+  /* Light Mode - High Contrast ChatGPT-style */
+  --bg: #f7f7f8; /* Soft off-white page background */
+  --fg: #0f0f0f;
+  --muted: #6b6b6b;
+  --card: #ffffff; /* Pure white backdrop for products */
+  --border: #d1d5db; /* Clearer, darker box lines */
+  --accent: #10a37f;
+  --accent-fg: #ffffff;
+  --chip: #e5e7eb;
+  --danger: #ef4444;
+  --radius: 12px;
+  --user-bubble: #ececec;
+  --input-bg: #ffffff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Dark Mode */
+    --bg: #212121;
+    --fg: #ececec;
+    --muted: #9b9b9b;
+    --card: #2a2a2a;
+    --border: #404040;
+    --accent: #10a37f;
+    --accent-fg: #ffffff;
+    --chip: #333333;
+    --danger: #ef4444;
+    --user-bubble: #2f2f2f;
+    --input-bg: #2f2f2f;
+  }
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  max-width: 840px;
+  margin: 0 auto;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+
+.mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--fg);
+  color: var(--bg);
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+  flex: none;
+  font-size: 16px;
+}
+
+.title { flex: 1; min-width: 0; }
+.title h1 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.2; }
+.title p { margin: 2px 0 0; font-size: 13px; color: var(--muted); }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  padding: 8px 14px;
+  transition: all 0.2s ease;
+}
+
+button:disabled { opacity: 0.3; cursor: not-allowed; }
+.ghost:hover:not(:disabled) { background: var(--chip); }
+
+#transcript {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  padding: 16px 0 32px;
+  scroll-behavior: smooth;
+}
+
+/* Hide scrollbar for a cleaner look */
+#transcript::-webkit-scrollbar { display: none; }
+#transcript { -ms-overflow-style: none; scrollbar-width: none; }
+
+.empty {
+  margin: auto;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 40px 0;
+}
+
+.empty h2 { margin: 0; font-size: 24px; font-weight: 600; }
+.empty p { margin: 4px 0 0; color: var(--muted); font-size: 15px; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 16px; }
+.chip {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 8px 16px;
+  font-size: 14px;
+  color: var(--fg);
+  border-radius: 999px;
+}
+.chip:hover { background: var(--chip); }
+
+.row { display: flex; flex-direction: column; gap: 12px; }
+.row.user { align-items: flex-end; }
+.row:not(.user) { align-items: flex-start; }
+
+.bubble {
+  background: var(--user-bubble);
+  color: var(--fg);
+  padding: 10px 16px;
+  border-radius: 20px;
+  max-width: 85%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 15px;
+}
+
+.assistant-text { 
+  white-space: pre-wrap; 
+  overflow-wrap: anywhere; 
+  font-size: 15px; 
+  line-height: 1.6;
+}
+
+.hint {
+  align-self: flex-start;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--chip);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+
+/* Standard Wrap Grid (Shows all options at once) */
+.grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  width: 100%;
+  margin-top: 8px;
+}
+
+.product {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05); /* Soft contrast shadow */
+  transition: box-shadow 0.2s, transform 0.2s;
+}
+.product:hover {
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  transform: translateY(-2px);
+}
+
+.product h3 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.35; }
+.product .brand { font-size: 13px; color: var(--muted); }
+.product .price { 
+  font-weight: 700; 
+  font-size: 16px; 
+  margin-top: 4px; 
+  color: var(--accent); /* Highlight price */
+}
+.product .desc {
+  font-size: 13px;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.tag {
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--chip);
+  border-radius: 4px;
+  padding: 3px 6px;
+  font-weight: 500;
+}
+
+.product a {
+  margin-top: 12px;
+  text-align: center;
+  text-decoration: none;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+.product a:hover { background: var(--chip); }
+
+.thinking { color: var(--muted); font-size: 14px; animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
+
+.error {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  font-size: 14px;
+  color: var(--danger);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  background: rgba(239, 68, 68, 0.05);
+}
+.error button { border-color: var(--danger); color: var(--danger); font-size: 13px; }
+
+/* Modern ChatGPT-style Composer */
+form {
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  padding: 8px 12px 8px 16px;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 24px;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.02);
+}
+form:focus-within {
+  border-color: var(--muted);
+}
+
+textarea {
+  flex: 1;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  max-height: 180px;
+  min-height: 24px;
+  padding: 8px 0;
+  margin-bottom: 2px;
+}
+
+.send {
+  background: var(--fg);
+  color: var(--bg);
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  margin-bottom: 4px;
+  font-weight: bold;
+}
+.send:hover:not(:disabled) { opacity: 0.8; }
+
+@media (max-width: 480px) {
+  .bubble { max-width: 95%; }
+  .grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+<div class="mark" aria-hidden="true">S</div>
+<div class="title">
+<h1 id="assistant-name">Shopping Assistant</h1>
+<p>Finds, compares and recommends products</p>
+</div>
+<button class="ghost" id="reset" type="button" disabled>New chat</button>
+</header>
+
+<main id="transcript" role="log" aria-live="polite"></main>
+
+<form id="composer">
+<textarea
+id="input"
+rows="1"
+placeholder="Message Shopping Assistant..."
+aria-label="Message"
+></textarea>
+<button class="send" id="send" type="submit" aria-label="Send" disabled>↑</button>
+</form>
+</div>
+
+<script>
+const API_URL = "/api/chat";
+const ASSISTANT_NAME = "Shopping Assistant";
+const SUGGESTIONS = [
+"A warm sweater under $150",
+"Gift ideas for a coffee lover",
+"Compare tote bags for daily commuting",
+];
+const STORAGE_KEY = "shopping-assistant:state";
+
+const transcriptEl = document.getElementById("transcript");
+const formEl = document.getElementById("composer");
+const inputEl = document.getElementById("input");
+const sendEl = document.getElementById("send");
+const resetEl = document.getElementById("reset");
+document.getElementById("assistant-name").textContent = ASSISTANT_NAME;
+
+let state = load();
+let busy = false;
+let controller = null;
+let lastUserMessage = null;
+
+function load() {
+try {
+const raw = localStorage.getItem(STORAGE_KEY);
+const parsed = raw ? JSON.parse(raw) : null;
+if (parsed && Array.isArray(parsed.messages)) {
+return { sessionId: parsed.sessionId || null, messages: parsed.messages };
+}
+} catch (_) {}
+return { sessionId: null, messages: [] };
+}
+
+function save() {
+try {
+localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+} catch (_) {}
+}
+
+function el(tag, className, text) {
+const node = document.createElement(tag);
+if (className) node.className = className;
+if (text != null) node.textContent = text;
+return node;
+}
+
+function formatPrice(price) {
+if (price == null || price === "") return null;
+if (typeof price === "number" && Number.isFinite(price)) {
+return new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(price);
+}
+return String(price);
+}
+
+function productCard(product) {
+const card = el("article", "product");
+card.appendChild(el("h3", null, product.title || product.parent_asin || "Product"));
+
+const brand = product.brand || product.store;
+if (brand) card.appendChild(el("div", "brand", brand));
+
+const price = formatPrice(product.price);
+if (price) card.appendChild(el("div", "price", price));
+
+if (product.description) card.appendChild(el("div", "desc", product.description));
+
+const categories = Array.isArray(product.categories) ? product.categories.slice(-2) : [];
+if (categories.length) {
+const tags = el("div", "tags");
+categories.forEach((c) => tags.appendChild(el("span", "tag", String(c))));
+card.appendChild(tags);
+}
+
+if (product.link) {
+const link = el("a", null, "View product");
+link.href = product.link;
+link.target = "_blank";
+link.rel = "noopener noreferrer";
+card.appendChild(link);
+}
+return card;
+}
+
+function renderMessage(message) {
+const row = el("div", "row " + message.role);
+if (message.role === "user") {
+row.appendChild(el("div", "bubble", message.text));
+return row;
+}
+
+if (message.text) {
+const textBubble = el("div", "assistant-text");
+textBubble.textContent = message.text;
+row.appendChild(textBubble);
+}
+
+const recs = Array.isArray(message.recommendations) ? message.recommendations : [];
+if (recs.length) {
+const grid = el("div", "grid");
+recs.forEach((p) => grid.appendChild(productCard(p || {})));
+row.appendChild(grid);
+}
+
+if (message.askAttribute && message.askAttribute !== "other") {
+row.appendChild(el("div", "hint", "Still deciding: " + message.askAttribute));
+}
+return row;
+}
+
+function renderEmptyState() {
+const wrap = el("div", "empty");
+const mark = el("div", "mark");
+mark.style.width = "48px";
+mark.style.height = "48px";
+mark.style.borderRadius = "50%";
+mark.style.fontSize = "20px";
+mark.textContent = ASSISTANT_NAME.charAt(0);
+wrap.appendChild(mark);
+
+const copy = el("div");
+copy.appendChild(el("h2", null, "How can I help?"));
+copy.appendChild(el("p", null, "Describe the item, your budget or the occasion."));
+wrap.appendChild(copy);
+
+const chips = el("div", "chips");
+SUGGESTIONS.forEach((s) => {
+const chip = el("button", "chip", s);
+chip.type = "button";
+chip.addEventListener("click", () => send(s));
+chips.appendChild(chip);
+});
+wrap.appendChild(chips);
+return wrap;
+}
+
+function render(extra) {
+transcriptEl.replaceChildren();
+if (!state.messages.length && !extra) {
+transcriptEl.appendChild(renderEmptyState());
+} else {
+state.messages.forEach((m) => transcriptEl.appendChild(renderMessage(m)));
+if (extra) transcriptEl.appendChild(extra);
+}
+resetEl.disabled = !state.messages.length && !busy;
+sendEl.disabled = busy || !inputEl.value.trim();
+transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function thinkingRow() {
+return el("div", "thinking", "Thinking...");
+}
+
+function errorRow(message) {
+const row = el("div", "error");
+row.appendChild(el("span", null, message));
+const retry = el("button", null, "Retry");
+retry.type = "button";
+retry.addEventListener("click", () => {
+if (lastUserMessage) send(lastUserMessage, true);
+});
+row.appendChild(retry);
+return row;
+}
+
+async function send(text, isRetry) {
+const trimmed = (text || "").trim();
+if (!trimmed || busy) return;
+
+if (!isRetry) {
+state.messages.push({ role: "user", text: trimmed });
+save();
+}
+lastUserMessage = trimmed;
+inputEl.value = "";
+autoGrow();
+
+busy = true;
+render(thinkingRow());
+
+controller = new AbortController();
+try {
+const response = await fetch(API_URL, {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify({ session_id: state.sessionId, message: trimmed }),
+signal: controller.signal,
+});
+
+let data = {};
+try {
+data = await response.json();
+} catch (_) {
+data = {};
+}
+
+if (!response.ok) {
+throw new Error((data && data.message) || "The assistant returned " + response.status + ".");
+}
+
+if (data && data.session_id) state.sessionId = data.session_id;
+
+state.messages.push({
+role: "assistant",
+text: (data && data.message) || "I can help look for something.",
+recommendations: data && Array.isArray(data.recommendations) ? data.recommendations : [],
+askAttribute: (data && data.ask_attribute) || null,
+});
+save();
+busy = false;
+render();
+} catch (error) {
+busy = false;
+if (error && error.name === "AbortError") {
+render();
+return;
+}
+render(errorRow((error && error.message) || "Something went wrong. Please try again."));
+} finally {
+controller = null;
+}
+}
+
+function autoGrow() {
+inputEl.style.height = "auto";
+inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + "px";
+}
+
+inputEl.addEventListener("input", () => {
+autoGrow();
+sendEl.disabled = busy || !inputEl.value.trim();
+});
+
+inputEl.addEventListener("keydown", (event) => {
+if (event.key === "Enter" && !event.shiftKey) {
+event.preventDefault();
+send(inputEl.value);
+}
+});
+
+formEl.addEventListener("submit", (event) => {
+event.preventDefault();
+send(inputEl.value);
+});
+
+resetEl.addEventListener("click", () => {
+if (controller) controller.abort();
+busy = false;
+state = { sessionId: null, messages: [] };
+try {
+localStorage.removeItem(STORAGE_KEY);
+} catch (_) {}
+lastUserMessage = null;
+render();
+inputEl.focus();
+});
+
+render();
+inputEl.focus();
+</script>
+</body>
+</html>
+
