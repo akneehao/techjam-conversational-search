@@ -42,6 +42,56 @@ Per scenario type (full system):
 | Intent override | 30 | 0.967 | 0.743 | 4.13 |
 | Boundary | 10 | 1.000 | 0.845 | 3.30 |
 
+### Full ablation
+
+Every configuration we measured end to end, each a complete run of the
+unmodified `evaluator/local_evaluator.py` over the 200 public sessions with
+`AGENT_USE_LLM=0` unless noted. Ranked by TechnicalScore.
+
+| # | Configuration | Score | HitRate@10 | MRR | MTTC |
+|---:|---|---|---|---|---|
+| 1 | **dual-track + ranksvm/5k — SHIPPED** | **0.8530** | 0.970 | 0.670 | 2.65 |
+| 2 | + Gemini router (36,820 tokens) | 0.8487 | 0.965 | 0.665 | 2.66 |
+| 3 | ranksvm / 5k, uniform routing | 0.8485 | 0.965 | 0.665 | 2.67 |
+| 4 | simplex / 5k | 0.8485 | 0.965 | 0.663 | 2.65 |
+| 5 | coord_ascent / 5k | 0.8467 | 0.965 | 0.658 | 2.66 |
+| 6 | mlp / 5k | 0.8431 | 0.965 | 0.648 | 2.69 |
+| 7 | simplex / 751 (previous default) | 0.8410 | 0.960 | 0.649 | 2.68 |
+| 8 | BM25 only, no dense, no re-rank | 0.8398 | 0.960 | 0.647 | 2.71 |
+| 9 | first-stage fix alone | 0.8387 | 0.960 | 0.643 | 2.71 |
+| 10 | gbdt / 5k | 0.8250 | 0.965 | 0.587 | 2.68 |
+| 11 | gbdt / 3k | 0.8135 | 0.950 | 0.584 | 2.83 |
+| 12 | clarification enabled | 0.7843 | 0.890 | 0.620 | 3.33 |
+| 13 | RRF k=10 (parameter fix only) | 0.7794 | 0.930 | 0.517 | 3.04 |
+| 14 | Day 4 original (symmetric RRF k=60) | 0.7617 | 0.940 | 0.448 | 3.13 |
+| 15 | Organizer weak-BM25 baseline | 0.1067 | 0.125 | 0.068 | 9.81 |
+
+Four points this table settles:
+
+- **Rows 3, 4, 5 and 7 are statistically tied** — 0.8485, 0.8485, 0.8467, 0.8410
+  sit inside a quarter of one session on a 200-session set. Score does not
+  choose between them; see section 5 for what does.
+- **Row 13 vs row 14** isolates the two halves of the fusion defect. Retuning
+  `k` from 60 to 10 recovers only +0.018 of a −0.077 hole; the remaining +0.059
+  requires making BM25 the sole gate. The parameter was never the main problem.
+- **Row 10 vs row 11** confirms the train/serve mismatch. The same model gains
+  +0.0115 purely from being trained on candidates drawn through the first stage
+  that actually serves it.
+- **Rows 8 and 9** show dense retrieval is *negative* as a peer retriever, even
+  in its safest configuration. It earns its place only as a re-ranker inside
+  BM25's candidate set, and as the feature source for the learned layer.
+
+### Where the score came from
+
+| Change | Gain | Fitted to the public set? |
+|---|---|---|
+| First-stage fix (symmetric RRF → BM25-gated re-rank) | **+0.0770** | No — architectural, zero learned parameters |
+| Learned re-ranker on a sound first stage | +0.0098 | Partly — trained on catalog-derived queries |
+| Dual-track routing | +0.0045 | Lightly — two hand-set weights |
+
+About **84% of the improvement has nothing to overfit**, which is the main
+reason we expect most of it to survive on the private 800.
+
 ---
 
 ## 2. Setup and Installation
@@ -413,6 +463,37 @@ already-mangled working copy. **A C-extension crash defeats Python-level
 robustness entirely**; the only defences are validating input before handing it
 to native code, and preferring pure-numpy artifacts.
 
+### 6.4 The score depends heavily on the shopper quoting the catalog
+
+The evaluator's simulated shopper discloses **verbatim substrings of the target
+product's own `features` / `details`**. That is what makes this a lexical task,
+and it is why BM25 dominates and why dense retrieval measures as negative.
+
+We quantified the dependency with a local harness that rewrites the constraint
+strings before they reach the agent (FAQ §7 permits modifying the evaluator for
+local experimentation; `evaluator/` itself is untouched and imported read-only):
+
+| Paraphrase level | HitRate@10 | MRR | MTTC | Score |
+|---|---|---|---|---|
+| L0 verbatim (control) | 0.970 | 0.670 | 2.65 | **0.8530** |
+| L1 vocabulary swapped | 0.805 | 0.543 | 4.20 | 0.7016 |
+| L2 swapped + 40% dropped | 0.755 | 0.481 | 4.76 | 0.6466 |
+| L3 heavy (3 tokens + filler) | 0.665 | 0.355 | 5.49 | 0.5493 |
+
+L1 changes nothing but vocabulary — `cotton` → *"soft breathable fabric"*,
+`buckle` → *"fastens with a clasp"* — and costs **−0.151**, roughly twice the
+entire first-stage gain. HitRate falls 0.970 → 0.805 because the BM25 gate stops
+retrieving the target at all, and no re-ranker can recover a document that was
+never retrieved.
+
+**This does not affect our submitted score.** The competition specification
+(§40) and the final-evaluation FAQ (§1) both state that final evaluation
+messages follow the released templates and that *"no undisclosed
+natural-language paraphrases are introduced"*. We report it because it is the
+honest boundary of the result: the system is specialised to an evaluator whose
+shopper quotes the catalog, and deploying it for real customers would require
+re-weighting dense retrieval upward and contrastively fine-tuning the embedder.
+
 ---
 
 ## 7. Disclosure: Latency, Token Usage, and Cost
@@ -498,10 +579,13 @@ service.**
    one session. Our choice of `ranksvm` rests on coverage, dual-metric
    agreement, training alignment and dependency footprint, not on a
    statistically significant gap.
-3. **Training queries are synthetic**, built from product text rather than real
-   customer language. The FAQ (§1) confirms the private sessions use the same
-   deterministic templates with no paraphrasing, which limits this risk here
-   but would not hold for real shoppers.
+3. **The system depends on the shopper quoting the catalog.** Measured in
+   section 6.4: a light vocabulary swap costs **−0.151**, and heavy paraphrase
+   costs −0.304. The competition specification and FAQ both rule out
+   paraphrasing in the private sessions, so this does not affect our score —
+   but it is the real ceiling on deploying this for actual customers, and the
+   single largest gap between "works on the benchmark" and "works in
+   production".
 4. **Diminishing returns from more training data.** Going from 751 to 4,965
    queries improved HitRate@10 (0.960 → 0.965) but barely moved the composite
    for the linear models, even though offline metrics improved substantially.
