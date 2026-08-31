@@ -1,0 +1,286 @@
+================================================================
+CONVERSATIONAL E-COMMERCE SEARCH AGENT
+TechJam 2026 - Written Project Description
+================================================================
+
+
+1. HOW OUR SOLUTION ADDRESSES THE PROBLEM STATEMENT
+----------------------------------------------------------------
+
+The problem: static keyword search cannot serve a shopper who
+describes what they want in conversation. Our agent talks with a
+customer for up to 10 turns and must return their hidden target
+product inside a top-10 list.
+
+We built a seven-layer system. Each layer is optional and fails
+safely, so the agent keeps working if any dependency is missing.
+
+PILLAR I - CORE ARCHITECTURE (dual-track routing + ranking)
+
+  The governing rule: BM25 alone decides WHICH documents are
+  candidates. Every other component reorders that set; none can
+  add or remove a member. Recall is therefore a pure function of
+  the lexical gate, and no learned component can cost a hit.
+
+  * Sparse gate: SQLite FTS5 + BM25 with tiered queries. The
+    strictest tier is "leaf category AND at least two specific
+    constraints"; broader tiers follow. The top 120 form the
+    candidate set.
+  * Dense re-rank: all-MiniLM-L6-v2 embeddings of the conversation
+    state, cosine-scored against those candidates only, blended
+    under a lexical rank prior so semantics reorder neighbours but
+    cannot overturn a decisive lexical match.
+  * Dual-track routing: the detected intent chooses both the dense
+    weight and the truncation depth, re-selected every turn from
+    live session state - precision (buying: weight 0.10, depth
+    120), discovery (browsing: 0.45, depth 200), and a recovery
+    track when the constraint set stops changing.
+  * Learned re-ranking: a trained model re-scores the top 60
+    candidates on 14 features before the top 10 are returned.
+
+  Intent detection has a DETERMINISTIC floor derived from the
+  message templates and accumulated constraints, so both tracks
+  work with no API key; the LLM router overrides it when present.
+
+PILLAR II - DIALOG STRATEGY (state tracking + proactive guidance)
+  * A conversational state tracker accumulates 8 constraint slots
+    (category, gender, colour, material, style, brand, use case,
+    budget) across turns.
+  * Intent override: when the shopper changes their mind
+    ("actually, I need running shoes instead"), the tracker
+    retires the stale category gate while KEEPING the accumulated
+    constraint evidence. Handled by a Gemini call with a
+    deterministic parser as fallback.
+  * Proactive guidance: when a category is pinned but no
+    discriminating constraint exists and the pool is over-general
+    (>1500 matches), the agent asks one targeted clarifying
+    question AND still returns its current best results in the
+    same turn. Implemented, shipped OFF by default - see the
+    negative result below.
+
+PILLAR III - SELF-EVOLUTION (personalized context distillation)
+  reset() distils the aggregate user_profile once per session. It
+  reaches the agent by exactly two routes - a compact PROFILE line
+  in the router prompt, and a small additive re-rank boost -
+  and NEITHER can add or remove a candidate.
+
+  That separation is a measured decision, not caution. Across the
+  200 public sessions preference_tags is nearly constant: fit 82%,
+  material 77%, comfort 72%, style 50%, durability 24%. All five
+  are already in the agent's GENERIC stop set, they describe
+  essentially every apparel product, and they derive from the
+  shopper's PRIOR purchases, which the evaluator never links to
+  the target. Gating on them would inject noise into 100% of
+  sessions. The filter keeps only rare discriminating tags
+  (warmth, weather, performance). PROFILE_INJECT=1|2 exposes the
+  injection variants so the claim stays measurable.
+
+  The agent also re-orchestrates its retrieval strategy at runtime:
+  the track is re-selected each turn, and a recovery pass widens
+  the pool and leans semantic when the constraint set stops
+  changing and the shopper is not converging.
+
+PILLAR IV - EVALUATION
+Measured with the UNMODIFIED official evaluator on the 200 public
+sessions. We never edited any file under evaluator/.
+
+  Configuration                    Hit@10    MRR     MTTC   Score
+  Organizer weak-BM25 baseline      0.125   0.068    9.81  0.1067
+  Retrieval only, no re-ranker      0.960   0.643    2.71  0.8387
+  Our full system (submitted)       0.970   0.670    2.65  0.8530
+
+  Per scenario (full system):
+    Buying           80 sessions   0.950   0.634    2.38
+    Browsing         80 sessions   0.988   0.656    2.27
+    Intent override  30 sessions   0.967   0.743    4.13
+    Boundary         10 sessions   1.000   0.845    3.30
+
+  Where the gain came from:
+    First-stage fix (RRF -> BM25-gated re-rank)      +0.0770
+    Learned re-ranker on a sound first stage         +0.0098
+    Dual-track routing                               +0.0045
+
+PILLAR V - USER INTERFACE & DEMONSTRATION
+
+To demonstrate the agent in a realistic setting, we wrapped the
+Python backend in a Flask web server (app.py) hosting a
+standalone single-page web application (templates/index.html) for
+interactive, real-time conversation.
+
+  * Aesthetic and UX: clean, modern and responsive, with
+    high-contrast dark/light mode, a floating message composer,
+    and a clear conversational flow.
+  * Rich product display: recommendations render as product cards
+    in a grid, each showing title, brand, price and category tags.
+  * Tech stack: pure HTML, CSS and JavaScript talking to the
+    backend through a single /api/chat JSON endpoint.
+
+
+KEY TECHNICAL CONTRIBUTION - three negative results we learned from
+----------------------------------------------------------------
+
+(a) A FUSION DEFECT WORTH -0.078.
+Our first-stage fused two equal-length (60) ranked lists with
+symmetric RRF at k=60. That is degenerate: rank 1 and rank 60
+differ by only 1.97x, so a document ranked LAST in both lists
+outscored the top hit of either, and the fused top-10 was an exact
+rank-merge of BM25[1..5] with dense[1..5] - dense was silently
+taking half the top-10, bypassing the category gate. Retuning k
+recovers only +0.018; the rest required making BM25 the sole gate.
+
+Two independent methods then agreed on the diagnosis. Our own
+simplex ranker, a constrained optimiser over 45k training pairs,
+converged to a ONE-HOT solution on lexical_score with exactly 0.0
+on rrf_score, bm25_rank_score, dense_rank_score and every
+embedding feature - discovering from data that the fusion was not
+carrying signal.
+
+(b) OUR FIRST RE-RANKER SCORED WORSE THAN NO RE-RANKING.
+0.7006 against a 0.7607 control. We found the cause by reading the
+trained models' own feature weights: sibling_max_sim took 68% of
+GBDT's total gain, because our labelling rule ("the category
+sibling most similar to the query") had leaked into it. We had
+also trained a category matcher when the real task is to find one
+specific product, and had not given the model the first-stage
+scores as features, so it had no floor. Fixing all three turned
+-0.06 into a real gain. The lesson: any self-supervised labelling
+rule can become visible to a feature, so inspect
+positive-vs-negative feature separation BEFORE training. Our
+offline metrics read above 0.99 NDCG throughout the period the
+real score was regressing.
+
+(c) OFFLINE METRICS ARE BLIND AT THE TAILS.
+We measured all seven models both on a 993-group held-out split
+and on the official evaluator. The middle of the table transfers
+perfectly, but both extremes invert: gbdt ranks 1st offline and
+LAST on the evaluator (0.825 vs 0.848), while simplex ranks last
+offline and 2nd on the evaluator. The held-out split is drawn from
+the same synthetic query distribution as training, so capacity
+buys offline score and costs transfer. Since a default is chosen
+from the tail, selecting on offline metrics alone would have
+shipped the worst of five models. We submit ranksvm, which is the
+only model strong on BOTH measurements.
+
+A fourth result worth stating: proactive clarification costs 0.064
+and cannot be made free. The FAQ permits asking a question and
+returning recommendations in the same turn, and we do - but the
+dominant cost is the narrow ask_attribute. The simulator matches
+any undisclosed constraint for "other" and only same-type
+constraints for a named slot, so a targeted question often returns
+a turn with zero information. That is a property of an
+unconditionally cooperative simulator, not of bad conversational
+design, so we kept the feature and documented the trade-off.
+
+
+2. DEVELOPMENT TOOLS USED
+----------------------------------------------------------------
+  * Visual Studio Code - main editor
+  * Jupyter Notebook - training pipeline and model comparison,
+    with plots (notebooks/training_pipeline.ipynb,
+    notebooks/model_comparison.ipynb)
+  * Git and GitHub - version control and team collaboration
+  * Claude Code (Anthropic) - AI pair-programming assistant used
+    during development
+  * Python venv - dependency isolation
+  * Windows 11, Python 3.12.6, CPU only. No GPU was used.
+
+
+3. APIs USED
+----------------------------------------------------------------
+  * Google Gemini API (model: gemini-3.5-flash-lite)
+    Used ONLY for intent classification and constraint-slot
+    extraction. We never send catalog text or product lists to
+    the LLM. Called through the REST endpoint with Python's
+    standard-library urllib - no vendor SDK dependency.
+
+    OPTIONAL, and measured: with the router enabled a full run
+    scores 0.8487 and uses 36,820 tokens (30,976 prompt + 5,844
+    completion, ~109 calls at 342 tokens each). Without it the
+    same configuration scores 0.8530. The router currently costs
+    0.0043, concentrated in intent_override, so our submitted
+    score is measured WITHOUT it.
+
+    Cost: under USD 0.01 for a full 200-session evaluation, and
+    USD 0.00 with no key set.
+
+    We also measured the failure case: with the router enabled and
+    the key's quota exhausted, the run completes at 0.8530 -
+    identical to the router being off - rather than crashing or
+    scoring zero.
+
+  * Hugging Face Hub - one-time download of the pretrained
+    sentence embedding model. After the first run everything is
+    cached locally and no network is needed.
+
+No other external service is used. Training makes zero API calls.
+
+
+4. LIBRARIES AND FRAMEWORKS USED
+----------------------------------------------------------------
+
+RUNTIME (needed to run the agent):
+  * sentence-transformers - dense embeddings (all-MiniLM-L6-v2)
+  * NumPy - vector maths, feature computation, model inference
+  * sqlite3 (stdlib) - FTS5 full-text index with BM25 ranking
+  * urllib, json, re, hashlib (stdlib) - Gemini REST calls,
+    parsing, tokenisation, cache keys
+  * Flask - the demo web UI
+  * LightGBM - ONLY for RERANK_MODEL=gbdt. The submitted ranksvm
+    is a 14-number weight vector scored with one numpy dot
+    product, so the shipped path needs no LightGBM at inference.
+
+TRAINING ONLY (not needed to reproduce our score):
+  * PyTorch - training the MLP ranker. At serving time the MLP
+    weights are exported to plain NumPy arrays.
+  * scikit-learn - LinearSVC, used to fit the pairwise RankSVM
+  * SciPy - SLSQP optimiser for the simplex-constrained ranker
+  * pandas, Matplotlib - notebook tables and plots
+  * Jupyter / ipykernel - notebook execution
+
+We implemented seven ranking models on a shared interface:
+fixed-weight baseline, simplex-constrained linear, RankSVM,
+coordinate ascent, MLP (BCE + ApproxNDCG loss), REINFORCE policy
+gradient, and GBDT (LightGBM LambdaRank). We evaluated each with
+the official evaluator and submitted RankSVM. REINFORCE is
+excluded from the default training set because it ranks worse than
+the first stage it is given, so it can only destroy the ordering.
+
+
+5. DATASETS AND ASSETS USED
+----------------------------------------------------------------
+
+PROVIDED BY THE ORGANIZER:
+  * Amazon Reviews 2023 catalog (McAuley Lab, UCSD), category
+    Clothing_Shoes_and_Jewelry - 50,000 frozen products. Fields
+    used: parent_asin, title, features, description, categories,
+    details, store, price, average_rating, rating_number.
+    See DATA_ATTRIBUTION.md.
+  * 200 labelled public development sessions, used only to
+    validate our system end to end. We did not train on them.
+
+PRETRAINED MODEL:
+  * sentence-transformers/all-MiniLM-L6-v2 (Hugging Face),
+    384-dimensional embeddings, used off the shelf without
+    fine-tuning.
+
+DATA WE GENERATED OURSELVES:
+  * A self-supervised training set for the re-ranker: 4,965
+    queries, 60 candidates each, 297,900 rows, split by query
+    group into 3,972 train / 993 test.
+    Method: sample a product, build a short slot-style query from
+    its category and a few of its own tokens (with about 30% of
+    tokens randomly dropped and generic shopper words mixed in),
+    run the real first stage, then label that product as the
+    positive and every other retrieved product as a hard negative.
+    Candidate generation mirrors whichever retrieval mode is
+    configured, and the saved metadata records it - a model
+    trained against one first stage and served on another loses
+    ground measurably.
+    This required NO manual labelling and NO paid API calls.
+
+  * A cached embedding matrix for the 50,000 products (74 MB),
+    generated once locally and reused on every later run.
+
+No external or proprietary dataset was used. No evaluation labels
+were used for training. No secrets are committed to the
+repository.
