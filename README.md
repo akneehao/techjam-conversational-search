@@ -948,7 +948,139 @@ fallback guarantee about it.
 
 ---
 
-## 10. Repository Map
+---
+
+## 10. Team Contributions
+
+Five people, nine layers. The "status" column says where each contribution sits
+in the **submitted** configuration, because layers 8 and 9 changed which
+components are on the scored path — see section 3. A layer being switched off is
+not a demotion: each was measured, and switching it off is a result its author
+produced.
+
+### Saffron — Learned re-ranking, model training, and proactive guidance
+
+- **Two-stage retrieval pipeline (layer 5).** Architected the re-rank stage and
+  engineered the 14-feature schema across semantic, lexical and first-stage
+  signals.
+- **Offline training.** Wrote the self-supervised data-generation scripts
+  (`training/label_generation.py`) and trained the RankSVM and LightGBM models.
+- **The v1 post-mortem.** Diagnosed the label leakage that made the first
+  re-ranker score *worse* than no re-ranking — the labelling rule "most
+  cosine-similar category sibling" had leaked into `sibling_max_sim`, which took
+  68% of GBDT's gain — and rebuilt the training pipeline, taking 0.7006 to
+  0.8530.
+
+- **Proactive guidance (layer 3).** Built the logic that asks a clarifying
+  question when the candidate pool exceeds 1,500 items, while still returning
+  results in the same turn.
+
+*Status: layer 3 is off, and the measurement is more interesting than the
+feature: it costs **−0.066**, and re-measuring it against layers 8 and 9 showed
+the prior does not make it cheaper but *sharper* — every constraint the shopper
+volunteers collapses the candidate tier by roughly an order of magnitude, so a
+turn spent on a narrow probe costs more than it used to (section 6.2). The
+learned re-ranker needs the dense track for its features, so it is
+loaded but does not run in the submitted configuration. The diagnosis is section
+6.1 and is the most transferable result in the repository: any self-supervised
+labelling rule can become visible to a feature, and offline NDCG read above 0.99
+throughout the period the real score was regressing.*
+
+### Elbert — Layers 8 and 9, and LLM integration
+
+- **Simulator-policy inversion (layer 8).** Reframed the task from retrieval to
+  identification: the shopper is not describing the product, they are quoting
+  strings that appear verbatim in one product's own catalog entry. Precomputes
+  the script all 50,000 products would generate and inverts it, returning
+  confidence tiers rather than scores. Worth **+0.054** on its own, and it takes
+  the median candidate set from 50,000 to 1 in two turns.
+- **Popularity prior (layer 9).** Identified that nothing in the system modelled
+  `P(product)` — targets are real purchase records, and the median one sits at
+  the **99.5th percentile** of the catalog by review count. Orders the
+  candidates the constraints cannot separate.
+- **Held-out validation.** Built `training/heldout_generalization.py`, which
+  scores 800 targets no tuning decision ever saw, establishing that
+  `HitRate@10 = 1.000` is a lucky draw on a ~0.986 system and that ~0.880 is the
+  honest forecast (section 8).
+- **Gemini intent router.** Engineered the prompts that detect intent overrides
+  — a shopper abruptly switching category — and flush stale constraints, with a
+  circuit breaker that splits failures by meaning: unrecoverable auth errors
+  trip permanently, rate limits back off exponentially and recover.
+
+*Status: layers 8 and 9 are the submitted configuration. They consume the slots
+Fati's layer 2 fills, so the two are coupled: the inversion is only as good as
+the constraints the parser hands it. The router is off, measured at −0.0043
+(section 7).*
+
+### Fati — Conversational state, dense retrieval and fusion
+
+- **State tracking (layer 2).** Built the 8-slot conversational memory —
+  category, gender, colour, material, style, brand, use case, budget — and the
+  deterministic regex parser that fills it without an LLM.
+- **Dense retrieval (layer 4).** Integrated `sentence-transformers`, built the
+  `all-MiniLM-L6-v2` semantic matching over the candidate set, and the local NPZ
+  embedding cache that makes startup fast after the first run.
+- **Fusion.** Wrote the reciprocal-rank fusion that merges the sparse and dense
+  ranked lists, and the tiered weighted RRF that combines the query tiers within
+  the sparse track.
+
+*Status: layer 2 is load-bearing. Every constraint layer 8 inverts arrives
+through the deterministic parser, and because the submitted run sets
+`AGENT_USE_LLM=0`, that parser carries the whole conversation alone — no
+fallback behind it. The tiered weighted RRF also runs every turn. The dense
+track and the symmetric sparse/dense fusion are off; diagnosing the fixed-k
+fusion defect and replacing it with a BM25-gated re-rank is worth **+0.077**,
+the single largest gain in the layers 1–6 era (section 6).*
+
+### Christian — Sparse retrieval and full-stack
+
+- **Sparse retrieval (layer 1).** Built the in-memory SQLite FTS5 index and the
+  tiered BM25 queries — strict leaf-category AND through to a broad OR recall
+  net — with the per-field weight vector that puts the shopper's stated category
+  ahead of title, features and description.
+- **Web API.** Wrapped the agent in a Flask server (`app.py`) exposing
+  `/api/chat` and managing browser session state.
+- **Interface (layer 7).** Designed and built the single-page application
+  (`templates/index.html`) in vanilla JavaScript and hand-written CSS.
+- **UX.** Responsive layout, auto-adapting light/dark mode, and the
+  high-contrast product grid that enriches bare ASINs with live titles and
+  prices.
+
+*Status: layer 1 is the foundation of the submitted configuration. Nothing
+reaches layers 8 and 9 that the sparse gate did not first retrieve, so its
+recall bounds the whole system, and the BM25 core alone already scores 0.8293 of
+the final 0.8870. Layer 7 is the demonstration surface and is not on the scored
+path — the evaluator calls the `Agent` class directly.*
+
+### Amogh — Dual-track routing, QA, DevOps and evaluation
+
+- **Dual-track routing (layer 6).** Built the per-turn strategy selector: the
+  detected intent chooses both the dense weight and the truncation depth, and it
+  is re-selected from live session state every turn rather than fixed at
+  startup. Precision for buying (weight 0.10, depth 120), discovery for browsing
+  (0.45, depth 200), and a recovery pass that widens the pool when the
+  constraint set has stopped changing and the shopper is not converging.
+- **Pipeline stability.** Found and patched the Windows CRLF corruption that
+  made LightGBM abort natively on a fresh clone — not a Python exception, so no
+  `try/except` could catch it — by configuring `.gitattributes` and hardening
+  the loader.
+- **Benchmarking.** Ran the official evaluator across every model
+  configuration, documented HitRate@10, MRR and MTTC, and generated
+  `results.json`.
+- **Testing and metrics.** Wrote the fallback tests covering a missing network,
+  absent API key and missing artifacts, and measured the latency and token-cost
+  figures in section 7.
+
+*Status: all on the scored path. Layer 6 still selects the truncation depth that
+sizes the candidate pool layer 8 then partitions, and it is worth +0.0045 in its
+own right. The graceful-degradation guarantee Amogh's tests pin is what makes
+the submitted configuration safe to run with every optional dependency absent —
+verified by blocking all third-party imports and re-running the full evaluation,
+which returns the same 0.887014.*
+
+---
+
+## 11. Repository Map
 
 ```text
 record_run.py                        writes RUN_MANIFEST.md beside results.json
