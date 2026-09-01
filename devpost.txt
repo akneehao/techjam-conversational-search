@@ -407,6 +407,18 @@ recovers at turns 2-4 on sessions it misses at turn 1.
   * Claude Code (Anthropic) - AI pair-programming assistant used
     during development
   * Python venv - dependency isolation
+  * unittest (stdlib) - 16 tests, including one that re-derives the
+    intent card and coarse category for 2,000 real catalog rows
+    through both our copy of the scenario policy and the official
+    evaluator's and requires them to be identical, so the layer-8
+    assumption fails loudly if the organizer ever changes it
+  * record_run.py (ours) - writes RUN_MANIFEST.md next to
+    results.json capturing the commit hash, working-tree
+    cleanliness, Python version, platform and every agent setting
+    as actually executed. Submission rules require the generated
+    results to be retained together with the commit hash and
+    environment details; reconstructing that after the fact is the
+    thing nobody can do reliably, so it is recorded at run time.
   * Windows 11, Python 3.12.6 and 3.13.14, CPU only. No GPU.
 
 
